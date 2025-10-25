@@ -7,6 +7,22 @@ var LOG_SPREADSHEET_NAME = 'Drive to Photos Upload Log'; // spreadsheet title
 var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
+var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
+var SUPPORTED_MIME_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+  'image/avif'
+];
+var SUPPORTED_MIME_TYPE_LOOKUP = (function () {
+  var lookup = {};
+  for (var i = 0; i < SUPPORTED_MIME_TYPES.length; i++) {
+    lookup[SUPPORTED_MIME_TYPES[i].toLowerCase()] = true;
+  }
+  return lookup;
+})();
 
 /* ===== ENTRYPOINT ===== */
 // Requires enabling the Advanced Drive Service (Drive API v2) for this project.
@@ -34,11 +50,25 @@ function runDriveToPhotosSync() {
   var pendingLogs = [];
   var pendingCursorRefs = [];
   var stop = false;
+  var skippedAlreadyLogged = 0;
+  var skippedUnsupportedMime = 0;
+  var processed = 0;
+  var lastProgressLogCount = 0;
+
+  Logger.log('Starting sync. Existing cursor: pageToken=' + (pageToken ? 'set' : 'unset') + ', index=' + offset + '.');
+
+  function logProgressIfNeeded() {
+    if (processed === 0) return;
+    if (processed === 1 || processed - lastProgressLogCount >= PROGRESS_LOG_INTERVAL) {
+      Logger.log('Progress: Processed ' + processed + ' item(s) this run (Uploaded: ' + uploaded + ', Pending: ' + pendingLogs.length + ', Skipped existing: ' + skippedAlreadyLogged + ', Skipped unsupported: ' + skippedUnsupportedMime + ').');
+      lastProgressLogCount = processed;
+    }
+  }
 
   while (!stop && uploaded < BATCH_SIZE) {
     var requestToken = pageToken || null;
     var resp = Drive.Files.list({
-      q: "mimeType contains 'image/' and trashed = false",
+      q: getDriveMimeFilterQuery_(),
       orderBy: 'modifiedDate asc, title asc',
       maxResults: fetchLimit,
       pageToken: requestToken
@@ -54,19 +84,25 @@ function runDriveToPhotosSync() {
 
     for (var i = offset; i < files.length; i++) {
       var meta = files[i];
+      processed++;
       var fileId = meta.id;
       if (uploadedMap[fileId]) {
         offset = i + 1;
+        skippedAlreadyLogged++;
+        logProgressIfNeeded();
         continue;
       }
 
       var mime = meta.mimeType || '';
-      if (!mime || mime.indexOf('image/') !== 0) {
+      if (!isSupportedMimeType_(mime)) {
         offset = i + 1;
+        skippedUnsupportedMime++;
+        logProgressIfNeeded();
         continue;
       }
 
       seen++;
+      logProgressIfNeeded();
 
       var name = meta.title || meta.originalFilename || fileId;
       var blob = DriveApp.getFileById(fileId).getBlob();
@@ -78,12 +114,14 @@ function runDriveToPhotosSync() {
         if (shouldRetryUpload) {
           pageToken = requestToken || '';
           offset = i;
+          logProgressIfNeeded();
           stop = true;
           break;
         }
 
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
         offset = i + 1;
+        logProgressIfNeeded();
         continue;
       }
 
@@ -101,6 +139,12 @@ function runDriveToPhotosSync() {
         if (batchResult === null) throw new Error('Failed to create Google Photos media items.');
         var logResult = logBatchResults_(sheet, pendingLogs, batchResult, uploadedMap);
         uploaded += logResult.successes;
+
+        if (logResult.successes > 0) {
+          Logger.log('Batch uploaded ' + logResult.successes + ' item(s). Total uploaded this run: ' + uploaded + '.');
+        } else if (!logResult.retryableIndexes.length && !logResult.skippedDetails.length) {
+          Logger.log('Batch completed with no successful uploads. Total uploaded this run: ' + uploaded + '.');
+        }
 
         for (var s = 0; s < logResult.skippedDetails.length; s++) {
           var skippedDetail = logResult.skippedDetails[s];
@@ -145,6 +189,12 @@ function runDriveToPhotosSync() {
     var remainingLog = logBatchResults_(sheet, pendingLogs, remainingResult, uploadedMap);
     uploaded += remainingLog.successes;
 
+    if (remainingLog.successes > 0) {
+      Logger.log('Final batch uploaded ' + remainingLog.successes + ' item(s). Total uploaded this run: ' + uploaded + '.');
+    } else if (!remainingLog.retryableIndexes.length && !remainingLog.skippedDetails.length) {
+      Logger.log('Final batch completed with no successful uploads. Total uploaded this run: ' + uploaded + '.');
+    }
+
     for (var rs = 0; rs < remainingLog.skippedDetails.length; rs++) {
       var skippedFinal = remainingLog.skippedDetails[rs];
       Logger.log('Skipping item after non-retryable batchCreate error for "' + skippedFinal.name + '": ' + skippedFinal.message);
@@ -164,7 +214,16 @@ function runDriveToPhotosSync() {
   }
 
   saveDriveCursor_(pageToken, offset);
-  Logger.log('Processed: ' + seen + ', Uploaded: ' + uploaded + ' (this run).');
+  Logger.log('Reviewed: ' + processed + ' Drive item(s). Attempted uploads: ' + seen + ', Uploaded: ' + uploaded + ' (this run). Skipped already logged: ' + skippedAlreadyLogged + ', Skipped unsupported mime: ' + skippedUnsupportedMime + '.');
+}
+
+function getDriveMimeFilterQuery_() {
+  var clauses = [];
+  for (var i = 0; i < SUPPORTED_MIME_TYPES.length; i++) {
+    clauses.push("mimeType = '" + SUPPORTED_MIME_TYPES[i] + "'");
+  }
+  if (!clauses.length) return "trashed = false";
+  return "trashed = false and (" + clauses.join(' or ') + ")";
 }
 
 /* ===== GOOGLE PHOTOS API HELPERS ===== */
@@ -281,9 +340,24 @@ function createMediaItemsBatch_(items, albumId) {
         errors[j] = { code: null, message: 'No result returned for media item.', status: {} };
       }
     }
+
+    var status = res.status || {};
+    var message = status.message || 'Unknown error';
+    ids.push(null);
+    errors[i] = {
+      code: status.code || null,
+      message: message,
+      status: status
+    };
   }
 
   return { ids: ids, errors: errors };
+}
+
+function isSupportedMimeType_(mime) {
+  if (!mime) return false;
+  var normalized = String(mime).toLowerCase();
+  return !!SUPPORTED_MIME_TYPE_LOOKUP[normalized];
 }
 
 function listAlbums_() {
