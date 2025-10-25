@@ -139,6 +139,9 @@ function uploadToPhotos_(blob, fileName) {
     return c >= 200 && c < 300;
   });
   if (!resp) return null;
+  if (resp.getResponseCode && (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300)) {
+    return null;
+  }
   return resp.getContentText();
 }
 
@@ -166,6 +169,10 @@ function createMediaItemsBatch_(items, albumId) {
   });
 
   if (!resp) return null;
+
+  if (resp.getResponseCode && (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300)) {
+    return null;
+  }
 
   var json = {};
   try { json = JSON.parse(resp.getContentText() || '{}'); } catch (e) {}
