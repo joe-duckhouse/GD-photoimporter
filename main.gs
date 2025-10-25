@@ -16,6 +16,7 @@ var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
+var MAX_RUNTIME_MS = 5 * 60 * 1000; // exit early so Apps Script triggers stay healthy
 /** MIME types that are eligible for upload to Google Photos. */
 var SUPPORTED_MIME_TYPES = [
   'image/jpeg',
@@ -72,6 +73,18 @@ function runDriveToPhotosSync() {
   var skippedUnsupportedMime = 0;
   var processed = 0;
   var lastProgressLogCount = 0;
+  var startTimeMs = new Date().getTime();
+  var lastPersistedToken = pageToken || '';
+  var lastPersistedIndex = offset || 0;
+
+  /** Safely persists the cursor only when there is no in-flight upload work. */
+  function maybePersistCursor(currentToken, currentIndex) {
+    if (batchItems.length || pendingLogs.length) return;
+    if (currentToken === lastPersistedToken && currentIndex === lastPersistedIndex) return;
+    saveDriveCursor_(currentToken, currentIndex);
+    lastPersistedToken = currentToken;
+    lastPersistedIndex = currentIndex;
+  }
 
   Logger.log('Starting sync. Existing cursor: pageToken=' + (pageToken ? 'set' : 'unset') + ', index=' + offset + '.');
 
@@ -85,6 +98,12 @@ function runDriveToPhotosSync() {
   }
 
   while (!stop && uploaded < BATCH_SIZE) {
+    if (new Date().getTime() - startTimeMs >= MAX_RUNTIME_MS) {
+      Logger.log('Stopping early to avoid Apps Script execution timeout. Progress saved.');
+      stop = true;
+      break;
+    }
+
     var requestToken = pageToken || null;
     var resp = Drive.Files.list({
       q: getDriveMimeFilterQuery_(),
@@ -97,6 +116,7 @@ function runDriveToPhotosSync() {
     if (!files.length) {
       pageToken = resp.nextPageToken || '';
       offset = 0;
+      maybePersistCursor(pageToken, offset);
       if (!pageToken) stop = true;
       continue;
     }
@@ -109,6 +129,7 @@ function runDriveToPhotosSync() {
         offset = i + 1;
         skippedAlreadyLogged++;
         logProgressIfNeeded();
+        maybePersistCursor(requestToken || '', offset);
         continue;
       }
 
@@ -117,6 +138,7 @@ function runDriveToPhotosSync() {
         offset = i + 1;
         skippedUnsupportedMime++;
         logProgressIfNeeded();
+        maybePersistCursor(requestToken || '', offset);
         continue;
       }
 
@@ -141,6 +163,7 @@ function runDriveToPhotosSync() {
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
         offset = i + 1;
         logProgressIfNeeded();
+        maybePersistCursor(requestToken || '', offset);
         continue;
       }
 
@@ -182,7 +205,16 @@ function runDriveToPhotosSync() {
         batchItems = [];
         pendingLogs = [];
         pendingCursorRefs = [];
+        maybePersistCursor(pageToken, offset);
         if (stop) break;
+      }
+
+      if (new Date().getTime() - startTimeMs >= MAX_RUNTIME_MS) {
+        Logger.log('Stopping early within page to avoid Apps Script timeout. Progress saved.');
+        pageToken = requestToken || '';
+        offset = i + 1;
+        stop = true;
+        break;
       }
 
       if (uploaded >= BATCH_SIZE) {
@@ -197,6 +229,7 @@ function runDriveToPhotosSync() {
 
     pageToken = resp.nextPageToken || '';
     offset = 0;
+    maybePersistCursor(pageToken, offset);
     if (!pageToken) {
       stop = true;
     }
@@ -230,6 +263,7 @@ function runDriveToPhotosSync() {
     }
     pendingLogs = [];
     pendingCursorRefs = [];
+    maybePersistCursor(pageToken, offset);
   }
 
   saveDriveCursor_(pageToken, offset);
