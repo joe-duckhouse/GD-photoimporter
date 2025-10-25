@@ -32,6 +32,7 @@ function runDriveToPhotosSync() {
   var fetchLimit = Math.min(BATCH_SIZE, 100); // Drive API maxResults cap
   var batchItems = [];
   var pendingLogs = [];
+  var pendingCursorRefs = [];
   var stop = false;
 
   while (!stop && uploaded < BATCH_SIZE) {
@@ -69,27 +70,42 @@ function runDriveToPhotosSync() {
 
       var name = meta.title || meta.originalFilename || fileId;
       var blob = DriveApp.getFileById(fileId).getBlob();
-      var token = uploadToPhotos_(blob, name);
-      if (!token) {
-        offset = i + 1;
-        Utilities.sleep(500);
-        continue;
+      var upload = uploadToPhotos_(blob, name);
+      if (!upload.token) {
+        Logger.log('Upload failed for "' + name + '": ' + (upload.error || 'Unknown error'));
+        pageToken = requestToken || '';
+        offset = i;
+        stop = true;
+        break;
       }
 
       batchItems.push({
         description: 'From Drive: ' + name,
-        simpleMediaItem: { uploadToken: token }
+        simpleMediaItem: { uploadToken: upload.token }
       });
       pendingLogs.push([fileId, name, mime, new Date(), null]);
+      pendingCursorRefs.push({ pageToken: requestToken || '', index: i });
 
       offset = i + 1;
 
       if (batchItems.length === PHOTOS_BATCH_LIMIT || uploaded + pendingLogs.length >= BATCH_SIZE) {
-        var ids = createMediaItemsBatch_(batchItems, albumId);
-        if (ids === null) throw new Error('Failed to create Google Photos media items.');
-        uploaded += logBatchResults_(sheet, pendingLogs, ids, uploadedMap);
+        var batchResult = createMediaItemsBatch_(batchItems, albumId);
+        if (batchResult === null) throw new Error('Failed to create Google Photos media items.');
+        var logResult = logBatchResults_(sheet, pendingLogs, batchResult.ids, uploadedMap);
+        uploaded += logResult.successes;
+        if (logResult.failedIndexes.length) {
+          var failureIndex = logResult.failedIndexes[0];
+          var cursorRef = pendingCursorRefs[failureIndex];
+          var failureMessage = getBatchErrorMessage_(batchResult.errors, failureIndex);
+          Logger.log('Stopping after batchCreate error for "' + pendingLogs[failureIndex][1] + '": ' + failureMessage);
+          pageToken = cursorRef ? cursorRef.pageToken : requestToken || '';
+          offset = cursorRef ? cursorRef.index : i;
+          stop = true;
+        }
         batchItems = [];
         pendingLogs = [];
+        pendingCursorRefs = [];
+        if (stop) break;
       }
 
       if (uploaded >= BATCH_SIZE) {
@@ -110,9 +126,20 @@ function runDriveToPhotosSync() {
   }
 
   if (batchItems.length) {
-    var remainingIds = createMediaItemsBatch_(batchItems, albumId);
-    if (remainingIds === null) throw new Error('Failed to create Google Photos media items.');
-    uploaded += logBatchResults_(sheet, pendingLogs, remainingIds, uploadedMap);
+    var remainingResult = createMediaItemsBatch_(batchItems, albumId);
+    if (remainingResult === null) throw new Error('Failed to create Google Photos media items.');
+    var remainingLog = logBatchResults_(sheet, pendingLogs, remainingResult.ids, uploadedMap);
+    uploaded += remainingLog.successes;
+    if (remainingLog.failedIndexes.length) {
+      var remainingIndex = remainingLog.failedIndexes[0];
+      var remainingCursor = pendingCursorRefs[remainingIndex];
+      var remainingMessage = getBatchErrorMessage_(remainingResult.errors, remainingIndex);
+      Logger.log('Stopping after final batchCreate error for "' + pendingLogs[remainingIndex][1] + '": ' + remainingMessage);
+      pageToken = remainingCursor ? remainingCursor.pageToken : pageToken;
+      offset = remainingCursor ? remainingCursor.index : offset;
+    }
+    pendingLogs = [];
+    pendingCursorRefs = [];
   }
 
   saveDriveCursor_(pageToken, offset);
@@ -146,7 +173,7 @@ function uploadToPhotos_(blob, fileName) {
 }
 
 function createMediaItemsBatch_(items, albumId) {
-  if (!items.length) return [];
+  if (!items.length) return { ids: [], errors: [] };
 
   var body = {
     newMediaItems: items
@@ -176,17 +203,48 @@ function createMediaItemsBatch_(items, albumId) {
 
   var json = {};
   try { json = JSON.parse(resp.getContentText() || '{}'); } catch (e) {}
+  if (json.error) {
+    var batchErrorMessage = json.error.message || 'Unknown batch error';
+    var batchErrorCode = json.error.code || null;
+    var batchErrors = [];
+    for (var e = 0; e < items.length; e++) {
+      batchErrors[e] = { code: batchErrorCode, message: batchErrorMessage, status: json.error };
+    }
+    return { ids: [], errors: batchErrors };
+  }
+
   var results = json.newMediaItemResults || [];
   var ids = [];
+  var errors = [];
+
   for (var i = 0; i < items.length; i++) {
     var res = results[i] || {};
     if (res.mediaItem && res.mediaItem.id) {
       ids.push(res.mediaItem.id);
-    } else {
-      ids.push(null);
+      errors[i] = null;
+      continue;
+    }
+
+    var status = res.status || {};
+    var message = status.message || 'Unknown error';
+    ids.push(null);
+    errors[i] = {
+      code: status.code || null,
+      message: message,
+      status: status
+    };
+  }
+
+  if (results.length < items.length) {
+    for (var j = results.length; j < items.length; j++) {
+      if (typeof errors[j] === 'undefined') {
+        ids[j] = null;
+        errors[j] = { code: null, message: 'No result returned for media item.', status: {} };
+      }
     }
   }
-  return ids;
+
+  return { ids: ids, errors: errors };
 }
 
 function listAlbums_() {
@@ -277,9 +335,14 @@ function ensureHeaders_(sheet) {
 function logBatchResults_(sheet, pendingLogs, ids, uploadedMap) {
   var rows = [];
   var successes = 0;
+  var failedIndexes = [];
+  ids = ids || [];
   for (var i = 0; i < pendingLogs.length; i++) {
     var mediaItemId = ids[i] || null;
-    if (!mediaItemId) continue;
+    if (!mediaItemId) {
+      failedIndexes.push(i);
+      continue;
+    }
     var row = pendingLogs[i];
     row[4] = mediaItemId;
     rows.push(row);
@@ -289,7 +352,7 @@ function logBatchResults_(sheet, pendingLogs, ids, uploadedMap) {
   if (rows.length) {
     sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HEADERS.length).setValues(rows);
   }
-  return successes;
+  return { successes: successes, failedIndexes: failedIndexes };
 }
 
 function buildUploadedMap_(sheet) {
@@ -357,6 +420,23 @@ function fetchWithRetry_(fn, maxAttempts, baseDelayMs, successPredicate) {
   return last;
 }
 
+function truncateString_(value, maxLength) {
+  if (!value) return '';
+  if (value.length <= maxLength) return value;
+  return value.substring(0, maxLength) + '...';
+}
+
+function getBatchErrorMessage_(errors, index) {
+  if (!errors || typeof index !== 'number' || index < 0 || index >= errors.length) {
+    return 'Unknown error';
+  }
+  var entry = errors[index];
+  if (!entry) return 'Unknown error';
+  if (entry.message) return entry.message;
+  if (entry.status && entry.status.message) return entry.status.message;
+  return 'Unknown error';
+}
+
 function shouldExcludeFile_(name, mime) {
   if (mime === 'image/bmp') return true;
   var lower = (name || '').toLowerCase();
@@ -422,10 +502,21 @@ function uploadBlobsWithConcurrency_(entries) {
       var token = null;
       if (resp && resp.getResponseCode && resp.getResponseCode() >= 200 && resp.getResponseCode() < 300) {
         token = resp.getContentText();
+        if (!token) {
+          var fallbackEmpty = uploadToPhotos_(entry.blob, entry.name);
+          if (!fallbackEmpty.token) {
+            Logger.log('Upload retry failed for "' + entry.name + '": ' + (fallbackEmpty.error || 'Unknown error'));
+          }
+          token = fallbackEmpty.token;
+        }
       } else {
-        token = uploadToPhotos_(entry.blob, entry.name);
+        var retry = uploadToPhotos_(entry.blob, entry.name);
+        if (!retry.token) {
+          Logger.log('Upload retry failed for "' + entry.name + '": ' + (retry.error || 'Unknown error'));
+        }
+        token = retry.token;
       }
-      tokens.push(token);
+      tokens.push(token || null);
       entry.blob = null;
     }
   }
