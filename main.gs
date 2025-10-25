@@ -1,6 +1,14 @@
-/** SIMPLE, ROBUST DRIVE TO GOOGLE PHOTOS UPLOADER (ES5 syntax) **/
+/**
+ * SIMPLE, ROBUST DRIVE TO GOOGLE PHOTOS UPLOADER (ES5 syntax).
+ *
+ * The script is designed to run inside Google Apps Script.  It scans Google Drive
+ * for supported image files and uploads them to Google Photos, keeping track of
+ * progress in a spreadsheet so reruns only handle new work.
+ */
 
 /* ===== CONFIG ===== */
+// Global configuration values for the sync run.  Adjust the options below to
+// fit your Drive folder structure and upload cadence.
 var BATCH_SIZE = 200; // how many images to upload per run
 var ALBUM_NAME = 'From Google Drive';
 var LOG_SPREADSHEET_NAME = 'Drive to Photos Upload Log'; // spreadsheet title
@@ -8,6 +16,7 @@ var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
+/** MIME types that are eligible for upload to Google Photos. */
 var SUPPORTED_MIME_TYPES = [
   'image/jpeg',
   'image/png',
@@ -16,6 +25,7 @@ var SUPPORTED_MIME_TYPES = [
   'image/heif',
   'image/avif'
 ];
+/** Fast lookup table built from the allowlist above. */
 var SUPPORTED_MIME_TYPE_LOOKUP = (function () {
   var lookup = {};
   for (var i = 0; i < SUPPORTED_MIME_TYPES.length; i++) {
@@ -25,6 +35,14 @@ var SUPPORTED_MIME_TYPE_LOOKUP = (function () {
 })();
 
 /* ===== ENTRYPOINT ===== */
+/**
+ * Main entry point for the sync job.
+ *
+ * Requires enabling the Advanced Drive Service (Drive API v2) and the Google
+ * Photos Library API.  Each invocation resumes from the persisted Drive cursor
+ * and uploads images to the configured album until BATCH_SIZE items have been
+ * processed or a retryable error occurs.
+ */
 // Requires enabling the Advanced Drive Service (Drive API v2) for this project.
 function runDriveToPhotosSync() {
   var sheet = getLogSheet_();
@@ -57,6 +75,7 @@ function runDriveToPhotosSync() {
 
   Logger.log('Starting sync. Existing cursor: pageToken=' + (pageToken ? 'set' : 'unset') + ', index=' + offset + '.');
 
+  /** Logs periodic progress updates so long runs surface activity. */
   function logProgressIfNeeded() {
     if (processed === 0) return;
     if (processed === 1 || processed - lastProgressLogCount >= PROGRESS_LOG_INTERVAL) {
@@ -217,6 +236,12 @@ function runDriveToPhotosSync() {
   Logger.log('Reviewed: ' + processed + ' Drive item(s). Attempted uploads: ' + seen + ', Uploaded: ' + uploaded + ' (this run). Skipped already logged: ' + skippedAlreadyLogged + ', Skipped unsupported mime: ' + skippedUnsupportedMime + '.');
 }
 
+/**
+ * Builds the Drive API query that filters to supported image MIME types.
+ *
+ * @return {string} Query string that excludes trashed files and restricts to
+ *     the SUPPORTED_MIME_TYPES allowlist.
+ */
 function getDriveMimeFilterQuery_() {
   var clauses = [];
   for (var i = 0; i < SUPPORTED_MIME_TYPES.length; i++) {
@@ -228,6 +253,14 @@ function getDriveMimeFilterQuery_() {
 
 /* ===== GOOGLE PHOTOS API HELPERS ===== */
 
+/**
+ * Uploads a single blob to Google Photos and returns the upload token.
+ *
+ * @param {Blob} blob Drive file contents.
+ * @param {string} fileName Original file name used for logging.
+ * @return {{token: (string|null), error: (?Object)}} Upload result and error
+ *     metadata.  Retryable failures are flagged via error.retryable.
+ */
 function uploadToPhotos_(blob, fileName) {
   var resp = fetchWithRetry_(function () {
     return UrlFetchApp.fetch('https://photoslibrary.googleapis.com/v1/uploads', {
@@ -270,6 +303,14 @@ function uploadToPhotos_(blob, fileName) {
   return { token: body, error: null };
 }
 
+/**
+ * Calls the Google Photos batchCreate endpoint to finalize uploaded items.
+ *
+ * @param {!Array<!Object>} items Items created via upload tokens.
+ * @param {string} albumId Target album ID or empty string for no album.
+ * @return {{ids: !Array<(string|null)>, errors: !Array<(?Object)>}|null} Batch
+ *     response or null when the API request failed outright.
+ */
 function createMediaItemsBatch_(items, albumId) {
   if (!items.length) return { ids: [], errors: [] };
 
@@ -354,12 +395,23 @@ function createMediaItemsBatch_(items, albumId) {
   return { ids: ids, errors: errors };
 }
 
+/**
+ * Checks whether the provided MIME type is allowlisted for upload.
+ *
+ * @param {string} mime MIME type from the Drive file metadata.
+ * @return {boolean} True when the MIME type is supported.
+ */
 function isSupportedMimeType_(mime) {
   if (!mime) return false;
   var normalized = String(mime).toLowerCase();
   return !!SUPPORTED_MIME_TYPE_LOOKUP[normalized];
 }
 
+/**
+ * Returns the list of Google Photos albums visible to the script.
+ *
+ * @return {!Array<!Object>} Album metadata objects.
+ */
 function listAlbums_() {
   var albums = [];
   var pageToken = null;
@@ -381,6 +433,12 @@ function listAlbums_() {
   return albums;
 }
 
+/**
+ * Looks up (or creates) the Google Photos album used for imports.
+ *
+ * @param {string} name Album title to search for or create.
+ * @return {(string|null)} Album ID when available.
+ */
 function getOrCreateAlbum_(name) {
   var albums = listAlbums_();
   for (var i = 0; i < albums.length; i++) {
@@ -405,6 +463,11 @@ function getOrCreateAlbum_(name) {
 
 /* ===== LOGGING SUPPORT ===== */
 
+/**
+ * Retrieves (or creates) the spreadsheet sheet used to track uploads.
+ *
+ * @return {!GoogleAppsScript.Spreadsheet.Sheet} Sheet handle.
+ */
 function getLogSheet_() {
   var props = PropertiesService.getScriptProperties();
   var ssId = props.getProperty('LOG_SHEET_ID');
@@ -429,6 +492,11 @@ function getLogSheet_() {
   return sheet;
 }
 
+/**
+ * Ensures the tracking sheet has the expected header row.
+ *
+ * @param {!GoogleAppsScript.Spreadsheet.Sheet} sheet Sheet to verify.
+ */
 function ensureHeaders_(sheet) {
   var lastRow = sheet.getLastRow();
   if (lastRow === 0) {
@@ -445,6 +513,16 @@ function ensureHeaders_(sheet) {
   }
 }
 
+/**
+ * Writes batchCreate results to the log and determines retry handling.
+ *
+ * @param {!GoogleAppsScript.Spreadsheet.Sheet} sheet Destination sheet.
+ * @param {!Array<!Array>} pendingLogs Rows prepared for logging.
+ * @param {{ids: !Array, errors: !Array}} result Batch API response object.
+ * @param {!Object} uploadedMap Mutable map of Drive IDs already handled.
+ * @return {{successes: number, retryableIndexes: !Array<number>, skippedDetails: !Array<!Object>}}
+ *     Breakdown of results used to control the sync loop.
+ */
 function logBatchResults_(sheet, pendingLogs, result, uploadedMap) {
   var ids = (result && result.ids) || [];
   var errors = (result && result.errors) || [];
@@ -493,12 +571,21 @@ function logBatchResults_(sheet, pendingLogs, result, uploadedMap) {
   };
 }
 
+/**
+ * Records a non-retryable upload failure in the log and marks the file as seen.
+ */
 function logNonRetryableUploadFailure_(sheet, fileId, name, mime, message, uploadedMap) {
   var row = [fileId, name, mime, new Date(), 'FAILED: ' + truncateString_(message, 200)];
   sheet.getRange(sheet.getLastRow() + 1, 1, 1, HEADERS.length).setValues([row]);
   if (uploadedMap) uploadedMap[fileId] = true;
 }
 
+/**
+ * Builds a lookup of Drive IDs that have already been processed.
+ *
+ * @param {!GoogleAppsScript.Spreadsheet.Sheet} sheet Source sheet.
+ * @return {!Object<string, boolean>} Map keyed by Drive file ID.
+ */
 function buildUploadedMap_(sheet) {
   var lastRow = sheet.getLastRow();
   var map = {};
@@ -511,6 +598,9 @@ function buildUploadedMap_(sheet) {
   return map;
 }
 
+/**
+ * Returns the persisted Drive pagination state (page token + index).
+ */
 function getDriveCursor_() {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('DRIVE_CURSOR_TOKEN');
@@ -521,6 +611,9 @@ function getDriveCursor_() {
   };
 }
 
+/**
+ * Persists the Drive cursor state used to resume future runs.
+ */
 function saveDriveCursor_(pageToken, index) {
   var props = PropertiesService.getScriptProperties();
   if (!pageToken && !index) {
@@ -533,15 +626,20 @@ function saveDriveCursor_(pageToken, index) {
 }
 
 /* ===== CACHE HELPERS ===== */
+/** Retrieves the cached album ID if one has been stored. */
 function getCachedAlbumId_() {
   return PropertiesService.getScriptProperties().getProperty('ALBUM_ID');
 }
+/** Stores the album ID for reuse across sync runs. */
 function cacheAlbumId_(id) {
   PropertiesService.getScriptProperties().setProperty('ALBUM_ID', id);
 }
 
 /* ===== RETRY WITH BACKOFF ===== */
 
+/**
+ * Executes a request function with exponential backoff retry logic.
+ */
 function fetchWithRetry_(fn, maxAttempts, baseDelayMs, successPredicate) {
   var attempt = 0;
   var last = null;
@@ -564,18 +662,21 @@ function fetchWithRetry_(fn, maxAttempts, baseDelayMs, successPredicate) {
   return last;
 }
 
+/** Shortens long strings for logging. */
 function truncateString_(value, maxLength) {
   if (!value) return '';
   if (value.length <= maxLength) return value;
   return value.substring(0, maxLength) + '...';
 }
 
+/** Determines if an HTTP status code is safe to retry. */
 function isRetryableStatusCode_(code) {
   if (code === 429) return true;
   if (typeof code !== 'number') return false;
   return code >= 500 && code < 600;
 }
 
+/** Derives a human-readable error message for a batchCreate entry. */
 function getBatchErrorMessage_(errors, index) {
   if (!errors || typeof index !== 'number' || index < 0 || index >= errors.length) {
     return 'Unknown error';
@@ -587,6 +688,7 @@ function getBatchErrorMessage_(errors, index) {
   return 'Unknown error';
 }
 
+/** Checks whether a batchCreate error warrants a retry. */
 function isRetryableBatchError_(error) {
   if (!error) return true;
   var code = null;
@@ -607,90 +709,3 @@ function isRetryableBatchError_(error) {
   return code === 8 || code === 10 || code === 13 || code === 14;
 }
 
-function shouldExcludeFile_(name, mime) {
-  if (mime === 'image/bmp') return true;
-  var lower = (name || '').toLowerCase();
-  for (var i = 0; i < EXCLUDED_EXTENSIONS.length; i++) {
-    var ext = EXCLUDED_EXTENSIONS[i];
-    if (lower.length >= ext.length && lower.lastIndexOf(ext) === lower.length - ext.length) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function drainUploadQueue_(queue) {
-  if (!queue || !queue.length) return [];
-  var drained = queue.splice(0, queue.length);
-  var tokens = uploadBlobsWithConcurrency_(drained);
-  var results = [];
-  for (var i = 0; i < drained.length; i++) {
-    results.push({ entry: drained[i], token: tokens[i] || null });
-  }
-  return results;
-}
-
-function shouldSkipBySize_(sizeValue) {
-  if (!sizeValue) return false;
-  var bytes = Number(sizeValue);
-  if (isNaN(bytes)) return false;
-  return bytes > MAX_IMAGE_BYTES;
-}
-
-function uploadBlobsWithConcurrency_(entries) {
-  if (!entries.length) return [];
-  var tokens = [];
-  var authToken = ScriptApp.getOAuthToken();
-  for (var i = 0; i < entries.length; i += UPLOAD_QUEUE_SIZE) {
-    var chunk = entries.slice(i, i + UPLOAD_QUEUE_SIZE);
-    var requests = [];
-    for (var j = 0; j < chunk.length; j++) {
-      requests.push({
-        url: 'https://photoslibrary.googleapis.com/v1/uploads',
-        method: 'post',
-        muteHttpExceptions: true,
-        headers: {
-          'Authorization': 'Bearer ' + authToken,
-          'Content-Type': 'application/octet-stream',
-          'X-Goog-Upload-File-Name': chunk[j].name,
-          'X-Goog-Upload-Protocol': 'raw'
-        },
-        payload: chunk[j].blob.getBytes()
-      });
-    }
-
-    var responses = [];
-    try {
-      responses = UrlFetchApp.fetchAll(requests);
-    } catch (e) {
-      responses = [];
-    }
-
-    for (var k = 0; k < chunk.length; k++) {
-      var entry = chunk[k];
-      var resp = responses[k];
-      var token = null;
-        if (resp && resp.getResponseCode && resp.getResponseCode() >= 200 && resp.getResponseCode() < 300) {
-          token = resp.getContentText();
-          if (!token) {
-            var fallbackEmpty = uploadToPhotos_(entry.blob, entry.name);
-            if (!fallbackEmpty.token) {
-              var fallbackMessage = (fallbackEmpty.error && fallbackEmpty.error.message) ? fallbackEmpty.error.message : 'Unknown error';
-              Logger.log('Upload retry failed for "' + entry.name + '": ' + fallbackMessage);
-            }
-            token = fallbackEmpty.token;
-          }
-        } else {
-          var retry = uploadToPhotos_(entry.blob, entry.name);
-          if (!retry.token) {
-            var retryMessage = (retry.error && retry.error.message) ? retry.error.message : 'Unknown error';
-            Logger.log('Upload retry failed for "' + entry.name + '": ' + retryMessage);
-          }
-          token = retry.token;
-        }
-      tokens.push(token || null);
-      entry.blob = null;
-    }
-  }
-  return tokens;
-}
