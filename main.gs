@@ -348,10 +348,11 @@ function buildUploadedMap_(sheet) {
 function getDriveCursor_() {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('DRIVE_CURSOR_TOKEN');
-  var index = props.getProperty('DRIVE_CURSOR_INDEX');
+  var index = Number(props.getProperty('DRIVE_CURSOR_INDEX'));
+  if (isNaN(index)) index = 0;
   return {
     pageToken: token || '',
-    index: index ? Number(index) : 0
+    index: index
   };
 }
 
@@ -363,7 +364,7 @@ function saveDriveCursor_(pageToken, index) {
     return;
   }
   props.setProperty('DRIVE_CURSOR_TOKEN', pageToken || '');
-  props.setProperty('DRIVE_CURSOR_INDEX', index || 0);
+  props.setProperty('DRIVE_CURSOR_INDEX', String(index || 0));
 }
 
 /* ===== CACHE HELPERS ===== */
