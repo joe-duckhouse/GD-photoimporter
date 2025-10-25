@@ -6,11 +6,14 @@ var ALBUM_NAME = 'From Google Drive';
 var LOG_SPREADSHEET_NAME = 'Drive to Photos Upload Log'; // spreadsheet title
 var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
+var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 
 /* ===== ENTRYPOINT ===== */
+// Requires enabling the Advanced Drive Service (Drive API v2) for this project.
 function runDriveToPhotosSync() {
   var sheet = getLogSheet_();
   ensureHeaders_(sheet);
+
   var uploadedMap = buildUploadedMap_(sheet);
 
   var albumId = getCachedAlbumId_();
@@ -20,38 +23,100 @@ function runDriveToPhotosSync() {
     cacheAlbumId_(albumId);
   }
 
-  var iter = DriveApp.searchFiles("mimeType contains 'image/' and trashed = false");
+  var cursor = getDriveCursor_();
+  var pageToken = cursor.pageToken;
+  var offset = cursor.index;
+
   var uploaded = 0;
   var seen = 0;
+  var fetchLimit = Math.min(BATCH_SIZE, 100); // Drive API maxResults cap
+  var batchItems = [];
+  var pendingLogs = [];
+  var stop = false;
 
-  while (iter.hasNext()) {
-    var file = iter.next();
-    var fileId = file.getId();
-    if (uploadedMap[fileId]) continue; // skip already uploaded
+  while (!stop && uploaded < BATCH_SIZE) {
+    var requestToken = pageToken || null;
+    var resp = Drive.Files.list({
+      q: "mimeType contains 'image/' and trashed = false",
+      orderBy: 'modifiedDate asc, title asc',
+      maxResults: fetchLimit,
+      pageToken: requestToken
+    });
 
-    var mime = file.getMimeType();
-    if (!mime || mime.indexOf('image/') !== 0) continue; // guard
-
-    var name = file.getName();
-    var blob = file.getBlob();
-
-    var token = uploadToPhotos_(blob, name);
-    if (!token) {
-      Utilities.sleep(500);
+    var files = resp.items || [];
+    if (!files.length) {
+      pageToken = resp.nextPageToken || '';
+      offset = 0;
+      if (!pageToken) stop = true;
       continue;
     }
 
-    var mediaItemId = createMediaItem_(token, albumId, 'From Drive: ' + name);
-    if (mediaItemId) {
-      sheet.appendRow([fileId, name, mime, new Date(), mediaItemId]);
-      uploaded++;
+    for (var i = offset; i < files.length; i++) {
+      var meta = files[i];
+      var fileId = meta.id;
+      if (uploadedMap[fileId]) {
+        offset = i + 1;
+        continue;
+      }
+
+      var mime = meta.mimeType || '';
+      if (!mime || mime.indexOf('image/') !== 0) {
+        offset = i + 1;
+        continue;
+      }
+
+      seen++;
+
+      var name = meta.title || meta.originalFilename || fileId;
+      var blob = DriveApp.getFileById(fileId).getBlob();
+      var token = uploadToPhotos_(blob, name);
+      if (!token) {
+        offset = i + 1;
+        Utilities.sleep(500);
+        continue;
+      }
+
+      batchItems.push({
+        description: 'From Drive: ' + name,
+        simpleMediaItem: { uploadToken: token }
+      });
+      pendingLogs.push([fileId, name, mime, new Date(), null]);
+
+      offset = i + 1;
+
+      if (batchItems.length === PHOTOS_BATCH_LIMIT || uploaded + pendingLogs.length >= BATCH_SIZE) {
+        var ids = createMediaItemsBatch_(batchItems, albumId);
+        if (ids === null) throw new Error('Failed to create Google Photos media items.');
+        uploaded += logBatchResults_(sheet, pendingLogs, ids, uploadedMap);
+        batchItems = [];
+        pendingLogs = [];
+      }
+
+      if (uploaded >= BATCH_SIZE) {
+        offset = i + 1;
+        pageToken = requestToken || '';
+        stop = true;
+        break;
+      }
     }
 
-    seen++;
-    if (uploaded >= BATCH_SIZE) break; // stop this run; next run continues
+    if (stop || uploaded >= BATCH_SIZE) break;
+
+    pageToken = resp.nextPageToken || '';
+    offset = 0;
+    if (!pageToken) {
+      stop = true;
+    }
   }
 
-  Logger.log('Tried: ' + seen + ', Uploaded: ' + uploaded + ' (this run).');
+  if (batchItems.length) {
+    var remainingIds = createMediaItemsBatch_(batchItems, albumId);
+    if (remainingIds === null) throw new Error('Failed to create Google Photos media items.');
+    uploaded += logBatchResults_(sheet, pendingLogs, remainingIds, uploadedMap);
+  }
+
+  saveDriveCursor_(pageToken, offset);
+  Logger.log('Processed: ' + seen + ', Uploaded: ' + uploaded + ' (this run).');
 }
 
 /* ===== GOOGLE PHOTOS API HELPERS ===== */
@@ -77,14 +142,11 @@ function uploadToPhotos_(blob, fileName) {
   return resp.getContentText();
 }
 
-function createMediaItem_(uploadToken, albumId, description) {
+function createMediaItemsBatch_(items, albumId) {
+  if (!items.length) return [];
+
   var body = {
-    newMediaItems: [
-      {
-        description: description || '',
-        simpleMediaItem: { uploadToken: uploadToken }
-      }
-    ]
+    newMediaItems: items
   };
   if (albumId) body.albumId = albumId;
 
@@ -108,10 +170,16 @@ function createMediaItem_(uploadToken, albumId, description) {
   var json = {};
   try { json = JSON.parse(resp.getContentText() || '{}'); } catch (e) {}
   var results = json.newMediaItemResults || [];
-  if (results.length && results[0].mediaItem && results[0].mediaItem.id) {
-    return results[0].mediaItem.id;
+  var ids = [];
+  for (var i = 0; i < items.length; i++) {
+    var res = results[i] || {};
+    if (res.mediaItem && res.mediaItem.id) {
+      ids.push(res.mediaItem.id);
+    } else {
+      ids.push(null);
+    }
   }
-  return null;
+  return ids;
 }
 
 function listAlbums_() {
@@ -199,16 +267,55 @@ function ensureHeaders_(sheet) {
   }
 }
 
+function logBatchResults_(sheet, pendingLogs, ids, uploadedMap) {
+  var rows = [];
+  var successes = 0;
+  for (var i = 0; i < pendingLogs.length; i++) {
+    var mediaItemId = ids[i] || null;
+    if (!mediaItemId) continue;
+    var row = pendingLogs[i];
+    row[4] = mediaItemId;
+    rows.push(row);
+    if (uploadedMap) uploadedMap[row[0]] = true;
+    successes++;
+  }
+  if (rows.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HEADERS.length).setValues(rows);
+  }
+  return successes;
+}
+
 function buildUploadedMap_(sheet) {
   var lastRow = sheet.getLastRow();
   var map = {};
   if (lastRow < 2) return map;
-  var values = sheet.getRange(2, 1, lastRow - 1, 1).getValues(); // column A
+  var values = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
   for (var i = 0; i < values.length; i++) {
     var id = values[i][0];
     if (id) map[id] = true;
   }
   return map;
+}
+
+function getDriveCursor_() {
+  var props = PropertiesService.getScriptProperties();
+  var token = props.getProperty('DRIVE_CURSOR_TOKEN');
+  var index = props.getProperty('DRIVE_CURSOR_INDEX');
+  return {
+    pageToken: token || '',
+    index: index ? Number(index) : 0
+  };
+}
+
+function saveDriveCursor_(pageToken, index) {
+  var props = PropertiesService.getScriptProperties();
+  if (!pageToken && !index) {
+    props.deleteProperty('DRIVE_CURSOR_TOKEN');
+    props.deleteProperty('DRIVE_CURSOR_INDEX');
+    return;
+  }
+  props.setProperty('DRIVE_CURSOR_TOKEN', pageToken || '');
+  props.setProperty('DRIVE_CURSOR_INDEX', index || 0);
 }
 
 /* ===== CACHE HELPERS ===== */
