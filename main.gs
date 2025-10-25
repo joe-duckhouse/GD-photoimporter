@@ -349,3 +349,78 @@ function fetchWithRetry_(fn, maxAttempts, baseDelayMs, successPredicate) {
   }
   return last;
 }
+
+function shouldExcludeFile_(name, mime) {
+  if (mime === 'image/bmp') return true;
+  var lower = (name || '').toLowerCase();
+  for (var i = 0; i < EXCLUDED_EXTENSIONS.length; i++) {
+    var ext = EXCLUDED_EXTENSIONS[i];
+    if (lower.length >= ext.length && lower.lastIndexOf(ext) === lower.length - ext.length) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function drainUploadQueue_(queue) {
+  if (!queue || !queue.length) return [];
+  var drained = queue.splice(0, queue.length);
+  var tokens = uploadBlobsWithConcurrency_(drained);
+  var results = [];
+  for (var i = 0; i < drained.length; i++) {
+    results.push({ entry: drained[i], token: tokens[i] || null });
+  }
+  return results;
+}
+
+function shouldSkipBySize_(sizeValue) {
+  if (!sizeValue) return false;
+  var bytes = Number(sizeValue);
+  if (isNaN(bytes)) return false;
+  return bytes > MAX_IMAGE_BYTES;
+}
+
+function uploadBlobsWithConcurrency_(entries) {
+  if (!entries.length) return [];
+  var tokens = [];
+  var authToken = ScriptApp.getOAuthToken();
+  for (var i = 0; i < entries.length; i += UPLOAD_QUEUE_SIZE) {
+    var chunk = entries.slice(i, i + UPLOAD_QUEUE_SIZE);
+    var requests = [];
+    for (var j = 0; j < chunk.length; j++) {
+      requests.push({
+        url: 'https://photoslibrary.googleapis.com/v1/uploads',
+        method: 'post',
+        muteHttpExceptions: true,
+        headers: {
+          'Authorization': 'Bearer ' + authToken,
+          'Content-Type': 'application/octet-stream',
+          'X-Goog-Upload-File-Name': chunk[j].name,
+          'X-Goog-Upload-Protocol': 'raw'
+        },
+        payload: chunk[j].blob.getBytes()
+      });
+    }
+
+    var responses = [];
+    try {
+      responses = UrlFetchApp.fetchAll(requests);
+    } catch (e) {
+      responses = [];
+    }
+
+    for (var k = 0; k < chunk.length; k++) {
+      var entry = chunk[k];
+      var resp = responses[k];
+      var token = null;
+      if (resp && resp.getResponseCode && resp.getResponseCode() >= 200 && resp.getResponseCode() < 300) {
+        token = resp.getContentText();
+      } else {
+        token = uploadToPhotos_(entry.blob, entry.name);
+      }
+      tokens.push(token);
+      entry.blob = null;
+    }
+  }
+  return tokens;
+}
