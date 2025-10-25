@@ -7,9 +7,6 @@ var LOG_SPREADSHEET_NAME = 'Drive to Photos Upload Log'; // spreadsheet title
 var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
-var UPLOAD_QUEUE_SIZE = 8; // how many upload requests to pipeline at once
-var EXCLUDED_EXTENSIONS = ['.sis', '.sil', '.sim', '.bmp'];
-var MAX_IMAGE_BYTES = 200 * 1024 * 1024; // Photos still-image upload cap
 
 /* ===== ENTRYPOINT ===== */
 // Requires enabling the Advanced Drive Service (Drive API v2) for this project.
@@ -35,41 +32,15 @@ function runDriveToPhotosSync() {
   var fetchLimit = Math.min(BATCH_SIZE, 100); // Drive API maxResults cap
   var batchItems = [];
   var pendingLogs = [];
-  var uploadQueue = [];
   var stop = false;
-
-  function processDrainedUploads_(drained) {
-    for (var j = 0; j < drained.length; j++) {
-      var record = drained[j];
-      var entry = record.entry;
-      if (!record.token) {
-        Logger.log('Upload failed for Drive file ' + entry.fileId + ' (' + entry.name + '), will retry on next run.');
-        Utilities.sleep(500);
-        continue;
-      }
-      batchItems.push({
-        description: 'From Drive: ' + entry.name,
-        simpleMediaItem: { uploadToken: record.token }
-      });
-      pendingLogs.push([entry.fileId, entry.name, entry.mime, entry.loggedAt, null]);
-    }
-  }
-
-  function maybeFlushUploadQueue_(force) {
-    if (!uploadQueue.length) return;
-    if (!force && uploadQueue.length < UPLOAD_QUEUE_SIZE) return;
-    var drained = drainUploadQueue_(uploadQueue);
-    processDrainedUploads_(drained);
-  }
 
   while (!stop && uploaded < BATCH_SIZE) {
     var requestToken = pageToken || null;
     var resp = Drive.Files.list({
-      q: "mimeType contains 'image/' and trashed = false and mimeType != 'image/bmp'",
+      q: "mimeType contains 'image/' and trashed = false",
       orderBy: 'modifiedDate asc, title asc',
       maxResults: fetchLimit,
-      pageToken: requestToken,
-      fields: 'nextPageToken,items(id,title,originalFilename,mimeType,fileSize)'
+      pageToken: requestToken
     });
 
     var files = resp.items || [];
@@ -94,50 +65,34 @@ function runDriveToPhotosSync() {
         continue;
       }
 
-      var name = meta.title || meta.originalFilename || fileId;
-      if (shouldSkipBySize_(meta.fileSize)) {
-        Logger.log('Skipping Drive file ' + fileId + ' (' + name + ') due to size > ' + MAX_IMAGE_BYTES + ' bytes.');
-        offset = i + 1;
-        continue;
-      }
-      if (shouldExcludeFile_(name, mime)) {
-        Logger.log('Skipping Drive file ' + fileId + ' (' + name + ') due to excluded type.');
-        offset = i + 1;
-        continue;
-      }
-
       seen++;
 
+      var name = meta.title || meta.originalFilename || fileId;
       var blob = DriveApp.getFileById(fileId).getBlob();
-      uploadQueue.push({
-        fileId: fileId,
-        name: name,
-        mime: mime,
-        blob: blob,
-        loggedAt: new Date()
-      });
-      maybeFlushUploadQueue_(false);
-
-      if (uploaded + pendingLogs.length + uploadQueue.length >= BATCH_SIZE ||
-          batchItems.length + uploadQueue.length >= PHOTOS_BATCH_LIMIT) {
-        maybeFlushUploadQueue_(true);
+      var token = uploadToPhotos_(blob, name);
+      if (!token) {
+        offset = i + 1;
+        Utilities.sleep(500);
+        continue;
       }
 
-      if (batchItems.length >= PHOTOS_BATCH_LIMIT ||
-          (uploaded + pendingLogs.length) >= BATCH_SIZE) {
+      batchItems.push({
+        description: 'From Drive: ' + name,
+        simpleMediaItem: { uploadToken: token }
+      });
+      pendingLogs.push([fileId, name, mime, new Date(), null]);
+
+      offset = i + 1;
+
+      if (batchItems.length === PHOTOS_BATCH_LIMIT || uploaded + pendingLogs.length >= BATCH_SIZE) {
         var ids = createMediaItemsBatch_(batchItems, albumId);
         if (ids === null) throw new Error('Failed to create Google Photos media items.');
-        var newlyUploaded = logBatchResults_(sheet, pendingLogs, ids, uploadedMap);
-        uploaded += newlyUploaded;
-        Logger.log('Uploaded batch: ' + newlyUploaded + ' (total this run: ' + uploaded + ')');
+        uploaded += logBatchResults_(sheet, pendingLogs, ids, uploadedMap);
         batchItems = [];
         pendingLogs = [];
       }
 
-      offset = i + 1;
-
       if (uploaded >= BATCH_SIZE) {
-        maybeFlushUploadQueue_(true);
         offset = i + 1;
         pageToken = requestToken || '';
         stop = true;
@@ -154,13 +109,10 @@ function runDriveToPhotosSync() {
     }
   }
 
-  maybeFlushUploadQueue_(true);
   if (batchItems.length) {
     var remainingIds = createMediaItemsBatch_(batchItems, albumId);
     if (remainingIds === null) throw new Error('Failed to create Google Photos media items.');
-    var finalUploaded = logBatchResults_(sheet, pendingLogs, remainingIds, uploadedMap);
-    uploaded += finalUploaded;
-    Logger.log('Uploaded final batch: ' + finalUploaded + ' (total this run: ' + uploaded + ')');
+    uploaded += logBatchResults_(sheet, pendingLogs, remainingIds, uploadedMap);
   }
 
   saveDriveCursor_(pageToken, offset);
@@ -348,11 +300,10 @@ function buildUploadedMap_(sheet) {
 function getDriveCursor_() {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('DRIVE_CURSOR_TOKEN');
-  var index = Number(props.getProperty('DRIVE_CURSOR_INDEX'));
-  if (isNaN(index)) index = 0;
+  var index = props.getProperty('DRIVE_CURSOR_INDEX');
   return {
     pageToken: token || '',
-    index: index
+    index: index ? Number(index) : 0
   };
 }
 
@@ -364,7 +315,7 @@ function saveDriveCursor_(pageToken, index) {
     return;
   }
   props.setProperty('DRIVE_CURSOR_TOKEN', pageToken || '');
-  props.setProperty('DRIVE_CURSOR_INDEX', String(index || 0));
+  props.setProperty('DRIVE_CURSOR_INDEX', index || 0);
 }
 
 /* ===== CACHE HELPERS ===== */
