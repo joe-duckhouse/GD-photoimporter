@@ -32,6 +32,7 @@ function runDriveToPhotosSync() {
   var fetchLimit = Math.min(BATCH_SIZE, 100); // Drive API maxResults cap
   var batchItems = [];
   var pendingLogs = [];
+  var pendingCursorRefs = [];
   var stop = false;
 
   while (!stop && uploaded < BATCH_SIZE) {
@@ -69,27 +70,56 @@ function runDriveToPhotosSync() {
 
       var name = meta.title || meta.originalFilename || fileId;
       var blob = DriveApp.getFileById(fileId).getBlob();
-      var token = uploadToPhotos_(blob, name);
-      if (!token) {
+      var upload = uploadToPhotos_(blob, name);
+      if (!upload.token) {
+        var uploadErrorMessage = (upload.error && upload.error.message) ? upload.error.message : 'Unknown error';
+        Logger.log('Upload failed for "' + name + '": ' + uploadErrorMessage);
+        var shouldRetryUpload = !upload.error || upload.error.retryable !== false;
+        if (shouldRetryUpload) {
+          pageToken = requestToken || '';
+          offset = i;
+          stop = true;
+          break;
+        }
+
+        logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
         offset = i + 1;
-        Utilities.sleep(500);
         continue;
       }
 
       batchItems.push({
         description: 'From Drive: ' + name,
-        simpleMediaItem: { uploadToken: token }
+        simpleMediaItem: { uploadToken: upload.token }
       });
       pendingLogs.push([fileId, name, mime, new Date(), null]);
+      pendingCursorRefs.push({ pageToken: requestToken || '', index: i });
 
       offset = i + 1;
 
       if (batchItems.length === PHOTOS_BATCH_LIMIT || uploaded + pendingLogs.length >= BATCH_SIZE) {
-        var ids = createMediaItemsBatch_(batchItems, albumId);
-        if (ids === null) throw new Error('Failed to create Google Photos media items.');
-        uploaded += logBatchResults_(sheet, pendingLogs, ids, uploadedMap);
+        var batchResult = createMediaItemsBatch_(batchItems, albumId);
+        if (batchResult === null) throw new Error('Failed to create Google Photos media items.');
+        var logResult = logBatchResults_(sheet, pendingLogs, batchResult, uploadedMap);
+        uploaded += logResult.successes;
+
+        for (var s = 0; s < logResult.skippedDetails.length; s++) {
+          var skippedDetail = logResult.skippedDetails[s];
+          Logger.log('Skipping item after non-retryable batchCreate error for "' + skippedDetail.name + '": ' + skippedDetail.message);
+        }
+
+        if (logResult.retryableIndexes.length) {
+          var failureIndex = logResult.retryableIndexes[0];
+          var cursorRef = pendingCursorRefs[failureIndex];
+          var failureMessage = getBatchErrorMessage_(batchResult.errors, failureIndex);
+          Logger.log('Stopping after batchCreate error for "' + pendingLogs[failureIndex][1] + '": ' + failureMessage);
+          pageToken = cursorRef ? cursorRef.pageToken : requestToken || '';
+          offset = cursorRef ? cursorRef.index : i;
+          stop = true;
+        }
         batchItems = [];
         pendingLogs = [];
+        pendingCursorRefs = [];
+        if (stop) break;
       }
 
       if (uploaded >= BATCH_SIZE) {
@@ -110,9 +140,27 @@ function runDriveToPhotosSync() {
   }
 
   if (batchItems.length) {
-    var remainingIds = createMediaItemsBatch_(batchItems, albumId);
-    if (remainingIds === null) throw new Error('Failed to create Google Photos media items.');
-    uploaded += logBatchResults_(sheet, pendingLogs, remainingIds, uploadedMap);
+    var remainingResult = createMediaItemsBatch_(batchItems, albumId);
+    if (remainingResult === null) throw new Error('Failed to create Google Photos media items.');
+    var remainingLog = logBatchResults_(sheet, pendingLogs, remainingResult, uploadedMap);
+    uploaded += remainingLog.successes;
+
+    for (var rs = 0; rs < remainingLog.skippedDetails.length; rs++) {
+      var skippedFinal = remainingLog.skippedDetails[rs];
+      Logger.log('Skipping item after non-retryable batchCreate error for "' + skippedFinal.name + '": ' + skippedFinal.message);
+    }
+
+    if (remainingLog.retryableIndexes.length) {
+      var remainingIndex = remainingLog.retryableIndexes[0];
+      var remainingCursor = pendingCursorRefs[remainingIndex];
+      var remainingMessage = getBatchErrorMessage_(remainingResult.errors, remainingIndex);
+      Logger.log('Stopping after final batchCreate error for "' + pendingLogs[remainingIndex][1] + '": ' + remainingMessage);
+      pageToken = remainingCursor ? remainingCursor.pageToken : pageToken;
+      offset = remainingCursor ? remainingCursor.index : offset;
+      stop = true;
+    }
+    pendingLogs = [];
+    pendingCursorRefs = [];
   }
 
   saveDriveCursor_(pageToken, offset);
@@ -138,12 +186,33 @@ function uploadToPhotos_(blob, fileName) {
     var c = r.getResponseCode();
     return c >= 200 && c < 300;
   });
-  if (!resp) return null;
-  return resp.getContentText();
+
+  if (!resp) {
+    return { token: null, error: { message: 'No response from upload endpoint after retries.', code: null, retryable: true } };
+  }
+
+  if (!resp.getResponseCode) {
+    return { token: null, error: { message: 'Upload failed: missing response code.', code: null, retryable: true } };
+  }
+
+  var code = resp.getResponseCode();
+  var body = resp.getContentText ? resp.getContentText() : '';
+
+  if (code < 200 || code >= 300) {
+    var message = 'HTTP ' + code;
+    if (body) message += ' - ' + truncateString_(body, 200);
+    return { token: null, error: { message: message, code: code, retryable: isRetryableStatusCode_(code) } };
+  }
+
+  if (!body) {
+    return { token: null, error: { message: 'Upload endpoint returned empty body.', code: code, retryable: false } };
+  }
+
+  return { token: body, error: null };
 }
 
 function createMediaItemsBatch_(items, albumId) {
-  if (!items.length) return [];
+  if (!items.length) return { ids: [], errors: [] };
 
   var body = {
     newMediaItems: items
@@ -167,19 +236,54 @@ function createMediaItemsBatch_(items, albumId) {
 
   if (!resp) return null;
 
+  if (!resp.getResponseCode || resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+    return null;
+  }
+
   var json = {};
   try { json = JSON.parse(resp.getContentText() || '{}'); } catch (e) {}
+  if (json.error) {
+    var batchErrorMessage = json.error.message || 'Unknown batch error';
+    var batchErrorCode = json.error.code || null;
+    var batchErrors = [];
+    for (var e = 0; e < items.length; e++) {
+      batchErrors[e] = { code: batchErrorCode, message: batchErrorMessage, status: json.error };
+    }
+    return { ids: [], errors: batchErrors };
+  }
+
   var results = json.newMediaItemResults || [];
   var ids = [];
+  var errors = [];
+
   for (var i = 0; i < items.length; i++) {
     var res = results[i] || {};
     if (res.mediaItem && res.mediaItem.id) {
       ids.push(res.mediaItem.id);
-    } else {
-      ids.push(null);
+      errors[i] = null;
+      continue;
+    }
+
+    var status = res.status || {};
+    var message = status.message || 'Unknown error';
+    ids.push(null);
+    errors[i] = {
+      code: status.code || null,
+      message: message,
+      status: status
+    };
+  }
+
+  if (results.length < items.length) {
+    for (var j = results.length; j < items.length; j++) {
+      if (typeof errors[j] === 'undefined') {
+        ids[j] = null;
+        errors[j] = { code: null, message: 'No result returned for media item.', status: {} };
+      }
     }
   }
-  return ids;
+
+  return { ids: ids, errors: errors };
 }
 
 function listAlbums_() {
@@ -267,22 +371,58 @@ function ensureHeaders_(sheet) {
   }
 }
 
-function logBatchResults_(sheet, pendingLogs, ids, uploadedMap) {
-  var rows = [];
+function logBatchResults_(sheet, pendingLogs, result, uploadedMap) {
+  var ids = (result && result.ids) || [];
+  var errors = (result && result.errors) || [];
+  var successRows = [];
+  var failureRows = [];
   var successes = 0;
+  var retryableIndexes = [];
+  var skippedDetails = [];
+
   for (var i = 0; i < pendingLogs.length; i++) {
+    var entry = pendingLogs[i];
     var mediaItemId = ids[i] || null;
-    if (!mediaItemId) continue;
-    var row = pendingLogs[i];
-    row[4] = mediaItemId;
-    rows.push(row);
-    if (uploadedMap) uploadedMap[row[0]] = true;
-    successes++;
+    if (mediaItemId) {
+      entry[4] = mediaItemId;
+      successRows.push(entry);
+      if (uploadedMap) uploadedMap[entry[0]] = true;
+      successes++;
+      continue;
+    }
+
+    var error = errors[i] || null;
+    if (isRetryableBatchError_(error)) {
+      retryableIndexes.push(i);
+      continue;
+    }
+
+    var failureRow = entry.slice();
+    var failureMessage = getBatchErrorMessage_(errors, i);
+    failureRow[4] = 'FAILED: ' + truncateString_(failureMessage, 200);
+    failureRows.push(failureRow);
+    skippedDetails.push({ index: i, name: entry[1], message: failureMessage });
+    if (uploadedMap) uploadedMap[entry[0]] = true;
   }
-  if (rows.length) {
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HEADERS.length).setValues(rows);
+
+  if (successRows.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, successRows.length, HEADERS.length).setValues(successRows);
   }
-  return successes;
+  if (failureRows.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, failureRows.length, HEADERS.length).setValues(failureRows);
+  }
+
+  return {
+    successes: successes,
+    retryableIndexes: retryableIndexes,
+    skippedDetails: skippedDetails
+  };
+}
+
+function logNonRetryableUploadFailure_(sheet, fileId, name, mime, message, uploadedMap) {
+  var row = [fileId, name, mime, new Date(), 'FAILED: ' + truncateString_(message, 200)];
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, HEADERS.length).setValues([row]);
+  if (uploadedMap) uploadedMap[fileId] = true;
 }
 
 function buildUploadedMap_(sheet) {
@@ -350,6 +490,49 @@ function fetchWithRetry_(fn, maxAttempts, baseDelayMs, successPredicate) {
   return last;
 }
 
+function truncateString_(value, maxLength) {
+  if (!value) return '';
+  if (value.length <= maxLength) return value;
+  return value.substring(0, maxLength) + '...';
+}
+
+function isRetryableStatusCode_(code) {
+  if (code === 429) return true;
+  if (typeof code !== 'number') return false;
+  return code >= 500 && code < 600;
+}
+
+function getBatchErrorMessage_(errors, index) {
+  if (!errors || typeof index !== 'number' || index < 0 || index >= errors.length) {
+    return 'Unknown error';
+  }
+  var entry = errors[index];
+  if (!entry) return 'Unknown error';
+  if (entry.message) return entry.message;
+  if (entry.status && entry.status.message) return entry.status.message;
+  return 'Unknown error';
+}
+
+function isRetryableBatchError_(error) {
+  if (!error) return true;
+  var code = null;
+  if (typeof error.code === 'number') code = error.code;
+  if (code === null && error.status && typeof error.status.code === 'number') {
+    code = error.status.code;
+  }
+
+  if (code === null && error.status && error.status.message) {
+    var upper = String(error.status.message).toUpperCase();
+    if (upper === 'RESOURCE_EXHAUSTED' || upper === 'UNAVAILABLE' || upper === 'ABORTED') {
+      return true;
+    }
+  }
+
+  if (code === null) return false;
+
+  return code === 8 || code === 10 || code === 13 || code === 14;
+}
+
 function shouldExcludeFile_(name, mime) {
   if (mime === 'image/bmp') return true;
   var lower = (name || '').toLowerCase();
@@ -413,12 +596,25 @@ function uploadBlobsWithConcurrency_(entries) {
       var entry = chunk[k];
       var resp = responses[k];
       var token = null;
-      if (resp && resp.getResponseCode && resp.getResponseCode() >= 200 && resp.getResponseCode() < 300) {
-        token = resp.getContentText();
-      } else {
-        token = uploadToPhotos_(entry.blob, entry.name);
-      }
-      tokens.push(token);
+        if (resp && resp.getResponseCode && resp.getResponseCode() >= 200 && resp.getResponseCode() < 300) {
+          token = resp.getContentText();
+          if (!token) {
+            var fallbackEmpty = uploadToPhotos_(entry.blob, entry.name);
+            if (!fallbackEmpty.token) {
+              var fallbackMessage = (fallbackEmpty.error && fallbackEmpty.error.message) ? fallbackEmpty.error.message : 'Unknown error';
+              Logger.log('Upload retry failed for "' + entry.name + '": ' + fallbackMessage);
+            }
+            token = fallbackEmpty.token;
+          }
+        } else {
+          var retry = uploadToPhotos_(entry.blob, entry.name);
+          if (!retry.token) {
+            var retryMessage = (retry.error && retry.error.message) ? retry.error.message : 'Unknown error';
+            Logger.log('Upload retry failed for "' + entry.name + '": ' + retryMessage);
+          }
+          token = retry.token;
+        }
+      tokens.push(token || null);
       entry.blob = null;
     }
   }
