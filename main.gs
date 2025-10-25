@@ -6,11 +6,16 @@ var ALBUM_NAME = 'From Google Drive';
 var LOG_SPREADSHEET_NAME = 'Drive to Photos Upload Log'; // spreadsheet title
 var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
+var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
+var UPLOAD_QUEUE_SIZE = 8; // how many upload requests to pipeline at once
+var EXCLUDED_EXTENSIONS = ['.sis', '.sil', '.sim', '.bmp'];
 
 /* ===== ENTRYPOINT ===== */
+// Requires enabling the Advanced Drive Service (Drive API v2) for this project.
 function runDriveToPhotosSync() {
   var sheet = getLogSheet_();
   ensureHeaders_(sheet);
+
   var uploadedMap = buildUploadedMap_(sheet);
 
   var albumId = getCachedAlbumId_();
@@ -20,38 +25,140 @@ function runDriveToPhotosSync() {
     cacheAlbumId_(albumId);
   }
 
-  var iter = DriveApp.searchFiles("mimeType contains 'image/' and trashed = false");
+  var cursor = getDriveCursor_();
+  var pageToken = cursor.pageToken;
+  var offset = cursor.index;
+
   var uploaded = 0;
   var seen = 0;
+  var fetchLimit = Math.min(BATCH_SIZE, 100); // Drive API maxResults cap
+  var batchItems = [];
+  var pendingLogs = [];
+  var uploadQueue = [];
+  var stop = false;
 
-  while (iter.hasNext()) {
-    var file = iter.next();
-    var fileId = file.getId();
-    if (uploadedMap[fileId]) continue; // skip already uploaded
+  function processDrainedUploads_(drained) {
+    for (var j = 0; j < drained.length; j++) {
+      var record = drained[j];
+      var entry = record.entry;
+      if (!record.token) {
+        Logger.log('Upload failed for Drive file ' + entry.fileId + ' (' + entry.name + '), will retry on next run.');
+        Utilities.sleep(500);
+        continue;
+      }
+      batchItems.push({
+        description: 'From Drive: ' + entry.name,
+        simpleMediaItem: { uploadToken: record.token }
+      });
+      pendingLogs.push([entry.fileId, entry.name, entry.mime, entry.loggedAt, null]);
+    }
+  }
 
-    var mime = file.getMimeType();
-    if (!mime || mime.indexOf('image/') !== 0) continue; // guard
+  function maybeFlushUploadQueue_(force) {
+    if (!uploadQueue.length) return;
+    if (!force && uploadQueue.length < UPLOAD_QUEUE_SIZE) return;
+    var drained = drainUploadQueue_(uploadQueue);
+    processDrainedUploads_(drained);
+  }
 
-    var name = file.getName();
-    var blob = file.getBlob();
+  while (!stop && uploaded < BATCH_SIZE) {
+    var requestToken = pageToken || null;
+    var resp = Drive.Files.list({
+      q: "mimeType contains 'image/' and trashed = false and mimeType != 'image/bmp'",
+      orderBy: 'modifiedDate asc, title asc',
+      maxResults: fetchLimit,
+      pageToken: requestToken,
+      fields: 'nextPageToken,items(id,title,originalFilename,mimeType)'
+    });
 
-    var token = uploadToPhotos_(blob, name);
-    if (!token) {
-      Utilities.sleep(500);
+    var files = resp.items || [];
+    if (!files.length) {
+      pageToken = resp.nextPageToken || '';
+      offset = 0;
+      if (!pageToken) stop = true;
       continue;
     }
 
-    var mediaItemId = createMediaItem_(token, albumId, 'From Drive: ' + name);
-    if (mediaItemId) {
-      sheet.appendRow([fileId, name, mime, new Date(), mediaItemId]);
-      uploaded++;
+    for (var i = offset; i < files.length; i++) {
+      var meta = files[i];
+      var fileId = meta.id;
+      if (uploadedMap[fileId]) {
+        offset = i + 1;
+        continue;
+      }
+
+      var mime = meta.mimeType || '';
+      if (!mime || mime.indexOf('image/') !== 0) {
+        offset = i + 1;
+        continue;
+      }
+
+      var name = meta.title || meta.originalFilename || fileId;
+      if (shouldExcludeFile_(name, mime)) {
+        Logger.log('Skipping Drive file ' + fileId + ' (' + name + ') due to excluded type.');
+        offset = i + 1;
+        continue;
+      }
+
+      seen++;
+
+      var blob = DriveApp.getFileById(fileId).getBlob();
+      uploadQueue.push({
+        fileId: fileId,
+        name: name,
+        mime: mime,
+        blob: blob,
+        loggedAt: new Date()
+      });
+      maybeFlushUploadQueue_(false);
+
+      if (uploaded + pendingLogs.length + uploadQueue.length >= BATCH_SIZE ||
+          batchItems.length + uploadQueue.length >= PHOTOS_BATCH_LIMIT) {
+        maybeFlushUploadQueue_(true);
+      }
+
+      if (batchItems.length >= PHOTOS_BATCH_LIMIT ||
+          (uploaded + pendingLogs.length) >= BATCH_SIZE) {
+        var ids = createMediaItemsBatch_(batchItems, albumId);
+        if (ids === null) throw new Error('Failed to create Google Photos media items.');
+        var newlyUploaded = logBatchResults_(sheet, pendingLogs, ids, uploadedMap);
+        uploaded += newlyUploaded;
+        Logger.log('Uploaded batch: ' + newlyUploaded + ' (total this run: ' + uploaded + ')');
+        batchItems = [];
+        pendingLogs = [];
+      }
+
+      offset = i + 1;
+
+      if (uploaded >= BATCH_SIZE) {
+        maybeFlushUploadQueue_(true);
+        offset = i + 1;
+        pageToken = requestToken || '';
+        stop = true;
+        break;
+      }
     }
 
-    seen++;
-    if (uploaded >= BATCH_SIZE) break; // stop this run; next run continues
+    if (stop || uploaded >= BATCH_SIZE) break;
+
+    pageToken = resp.nextPageToken || '';
+    offset = 0;
+    if (!pageToken) {
+      stop = true;
+    }
   }
 
-  Logger.log('Tried: ' + seen + ', Uploaded: ' + uploaded + ' (this run).');
+  maybeFlushUploadQueue_(true);
+  if (batchItems.length) {
+    var remainingIds = createMediaItemsBatch_(batchItems, albumId);
+    if (remainingIds === null) throw new Error('Failed to create Google Photos media items.');
+    var finalUploaded = logBatchResults_(sheet, pendingLogs, remainingIds, uploadedMap);
+    uploaded += finalUploaded;
+    Logger.log('Uploaded final batch: ' + finalUploaded + ' (total this run: ' + uploaded + ')');
+  }
+
+  saveDriveCursor_(pageToken, offset);
+  Logger.log('Processed: ' + seen + ', Uploaded: ' + uploaded + ' (this run).');
 }
 
 /* ===== GOOGLE PHOTOS API HELPERS ===== */
@@ -77,14 +184,11 @@ function uploadToPhotos_(blob, fileName) {
   return resp.getContentText();
 }
 
-function createMediaItem_(uploadToken, albumId, description) {
+function createMediaItemsBatch_(items, albumId) {
+  if (!items.length) return [];
+
   var body = {
-    newMediaItems: [
-      {
-        description: description || '',
-        simpleMediaItem: { uploadToken: uploadToken }
-      }
-    ]
+    newMediaItems: items
   };
   if (albumId) body.albumId = albumId;
 
@@ -108,10 +212,16 @@ function createMediaItem_(uploadToken, albumId, description) {
   var json = {};
   try { json = JSON.parse(resp.getContentText() || '{}'); } catch (e) {}
   var results = json.newMediaItemResults || [];
-  if (results.length && results[0].mediaItem && results[0].mediaItem.id) {
-    return results[0].mediaItem.id;
+  var ids = [];
+  for (var i = 0; i < items.length; i++) {
+    var res = results[i] || {};
+    if (res.mediaItem && res.mediaItem.id) {
+      ids.push(res.mediaItem.id);
+    } else {
+      ids.push(null);
+    }
   }
-  return null;
+  return ids;
 }
 
 function listAlbums_() {
@@ -199,16 +309,55 @@ function ensureHeaders_(sheet) {
   }
 }
 
+function logBatchResults_(sheet, pendingLogs, ids, uploadedMap) {
+  var rows = [];
+  var successes = 0;
+  for (var i = 0; i < pendingLogs.length; i++) {
+    var mediaItemId = ids[i] || null;
+    if (!mediaItemId) continue;
+    var row = pendingLogs[i];
+    row[4] = mediaItemId;
+    rows.push(row);
+    if (uploadedMap) uploadedMap[row[0]] = true;
+    successes++;
+  }
+  if (rows.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HEADERS.length).setValues(rows);
+  }
+  return successes;
+}
+
 function buildUploadedMap_(sheet) {
   var lastRow = sheet.getLastRow();
   var map = {};
   if (lastRow < 2) return map;
-  var values = sheet.getRange(2, 1, lastRow - 1, 1).getValues(); // column A
+  var values = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
   for (var i = 0; i < values.length; i++) {
     var id = values[i][0];
     if (id) map[id] = true;
   }
   return map;
+}
+
+function getDriveCursor_() {
+  var props = PropertiesService.getScriptProperties();
+  var token = props.getProperty('DRIVE_CURSOR_TOKEN');
+  var index = props.getProperty('DRIVE_CURSOR_INDEX');
+  return {
+    pageToken: token || '',
+    index: index ? Number(index) : 0
+  };
+}
+
+function saveDriveCursor_(pageToken, index) {
+  var props = PropertiesService.getScriptProperties();
+  if (!pageToken && !index) {
+    props.deleteProperty('DRIVE_CURSOR_TOKEN');
+    props.deleteProperty('DRIVE_CURSOR_INDEX');
+    return;
+  }
+  props.setProperty('DRIVE_CURSOR_TOKEN', pageToken || '');
+  props.setProperty('DRIVE_CURSOR_INDEX', index || 0);
 }
 
 /* ===== CACHE HELPERS ===== */
@@ -241,4 +390,72 @@ function fetchWithRetry_(fn, maxAttempts, baseDelayMs, successPredicate) {
     attempt++;
   }
   return last;
+}
+
+function shouldExcludeFile_(name, mime) {
+  if (mime === 'image/bmp') return true;
+  var lower = (name || '').toLowerCase();
+  for (var i = 0; i < EXCLUDED_EXTENSIONS.length; i++) {
+    var ext = EXCLUDED_EXTENSIONS[i];
+    if (lower.length >= ext.length && lower.lastIndexOf(ext) === lower.length - ext.length) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function drainUploadQueue_(queue) {
+  if (!queue || !queue.length) return [];
+  var drained = queue.splice(0, queue.length);
+  var tokens = uploadBlobsWithConcurrency_(drained);
+  var results = [];
+  for (var i = 0; i < drained.length; i++) {
+    results.push({ entry: drained[i], token: tokens[i] || null });
+  }
+  return results;
+}
+
+function uploadBlobsWithConcurrency_(entries) {
+  if (!entries.length) return [];
+  var tokens = [];
+  var authToken = ScriptApp.getOAuthToken();
+  for (var i = 0; i < entries.length; i += UPLOAD_QUEUE_SIZE) {
+    var chunk = entries.slice(i, i + UPLOAD_QUEUE_SIZE);
+    var requests = [];
+    for (var j = 0; j < chunk.length; j++) {
+      requests.push({
+        url: 'https://photoslibrary.googleapis.com/v1/uploads',
+        method: 'post',
+        muteHttpExceptions: true,
+        headers: {
+          'Authorization': 'Bearer ' + authToken,
+          'Content-Type': 'application/octet-stream',
+          'X-Goog-Upload-File-Name': chunk[j].name,
+          'X-Goog-Upload-Protocol': 'raw'
+        },
+        payload: chunk[j].blob.getBytes()
+      });
+    }
+
+    var responses = [];
+    try {
+      responses = UrlFetchApp.fetchAll(requests);
+    } catch (e) {
+      responses = [];
+    }
+
+    for (var k = 0; k < chunk.length; k++) {
+      var entry = chunk[k];
+      var resp = responses[k];
+      var token = null;
+      if (resp && resp.getResponseCode && resp.getResponseCode() >= 200 && resp.getResponseCode() < 300) {
+        token = resp.getContentText();
+      } else {
+        token = uploadToPhotos_(entry.blob, entry.name);
+      }
+      tokens.push(token);
+      entry.blob = null;
+    }
+  }
+  return tokens;
 }
