@@ -165,29 +165,11 @@ function uploadToPhotos_(blob, fileName) {
     var c = r.getResponseCode();
     return c >= 200 && c < 300;
   });
-
-  if (!resp) {
-    return { token: null, error: 'No response from upload endpoint after retries.' };
+  if (!resp) return null;
+  if (resp.getResponseCode && (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300)) {
+    return null;
   }
-
-  if (!resp.getResponseCode) {
-    return { token: null, error: 'Upload failed: missing response code.' };
-  }
-
-  var code = resp.getResponseCode();
-  var body = resp.getContentText ? resp.getContentText() : '';
-
-  if (code < 200 || code >= 300) {
-    var message = 'HTTP ' + code;
-    if (body) message += ' - ' + truncateString_(body, 200);
-    return { token: null, error: message };
-  }
-
-  if (!body) {
-    return { token: null, error: 'Upload endpoint returned empty body.' };
-  }
-
-  return { token: body, error: null };
+  return resp.getContentText();
 }
 
 function createMediaItemsBatch_(items, albumId) {
@@ -215,7 +197,7 @@ function createMediaItemsBatch_(items, albumId) {
 
   if (!resp) return null;
 
-  if (!resp.getResponseCode || resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+  if (resp.getResponseCode && (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300)) {
     return null;
   }
 
