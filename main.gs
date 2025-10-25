@@ -381,6 +381,15 @@ function createMediaItemsBatch_(items, albumId) {
         errors[j] = { code: null, message: 'No result returned for media item.', status: {} };
       }
     }
+
+    var status = res.status || {};
+    var message = status.message || 'Unknown error';
+    ids.push(null);
+    errors[i] = {
+      code: status.code || null,
+      message: message,
+      status: status
+    };
   }
 
   return { ids: ids, errors: errors };
