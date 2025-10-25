@@ -16,7 +16,7 @@ var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
-var MAX_RUNTIME_MS = 5 * 60 * 1000; // exit early so Apps Script triggers stay healthy
+var MAX_RUNTIME_MS = 4.5 * 60 * 1000; // exit early with buffer so time-driven triggers can restart
 /** MIME types that are eligible for upload to Google Photos. */
 var SUPPORTED_MIME_TYPES = [
   'image/jpeg',

@@ -33,7 +33,7 @@ This Apps Script scans Google Drive for supported image files and uploads them t
 ## Operational notes
 
 * The script only uploads files whose MIME type matches the supported list (JPEG, PNG, WEBP, HEIC/HEIF, and AVIF). Unsupported files are skipped and reported in the execution log.
-* Uploads stop when `BATCH_SIZE` items are uploaded, when the five-minute safety runtime is reached, or when a retryable error occurs. Cursor progress is saved throughout each run so long executions resume close to where they stopped and keep the Apps Script trigger healthy.
+* Uploads stop when `BATCH_SIZE` items are uploaded, when the ~4.5 minute safety runtime is reached (leaving buffer for clean shutdown), or when a retryable error occurs. Cursor progress is saved throughout each run so long executions resume close to where they stopped and keep the Apps Script trigger healthy.
 * Update `ALBUM_NAME` to control the Google Photos album used for imports. The album is created automatically if it does not exist.
 * Execution logs include periodic progress updates. Use Apps Script's execution log viewer to monitor run details.
 
