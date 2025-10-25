@@ -9,6 +9,7 @@ var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var UPLOAD_QUEUE_SIZE = 8; // how many upload requests to pipeline at once
 var EXCLUDED_EXTENSIONS = ['.sis', '.sil', '.sim', '.bmp'];
+var MAX_IMAGE_BYTES = 200 * 1024 * 1024; // Photos still-image upload cap
 
 /* ===== ENTRYPOINT ===== */
 // Requires enabling the Advanced Drive Service (Drive API v2) for this project.
@@ -68,7 +69,7 @@ function runDriveToPhotosSync() {
       orderBy: 'modifiedDate asc, title asc',
       maxResults: fetchLimit,
       pageToken: requestToken,
-      fields: 'nextPageToken,items(id,title,originalFilename,mimeType)'
+      fields: 'nextPageToken,items(id,title,originalFilename,mimeType,fileSize)'
     });
 
     var files = resp.items || [];
@@ -94,6 +95,11 @@ function runDriveToPhotosSync() {
       }
 
       var name = meta.title || meta.originalFilename || fileId;
+      if (shouldSkipBySize_(meta.fileSize)) {
+        Logger.log('Skipping Drive file ' + fileId + ' (' + name + ') due to size > ' + MAX_IMAGE_BYTES + ' bytes.');
+        offset = i + 1;
+        continue;
+      }
       if (shouldExcludeFile_(name, mime)) {
         Logger.log('Skipping Drive file ' + fileId + ' (' + name + ') due to excluded type.');
         offset = i + 1;
@@ -413,6 +419,13 @@ function drainUploadQueue_(queue) {
     results.push({ entry: drained[i], token: tokens[i] || null });
   }
   return results;
+}
+
+function shouldSkipBySize_(sizeValue) {
+  if (!sizeValue) return false;
+  var bytes = Number(sizeValue);
+  if (isNaN(bytes)) return false;
+  return bytes > MAX_IMAGE_BYTES;
 }
 
 function uploadBlobsWithConcurrency_(entries) {
