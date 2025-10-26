@@ -1,7 +1,24 @@
 # Google Drive to Google Photos Importer
 
-This Apps Script scans Google Drive for supported image files and uploads them to Google Photos while keeping track of progress
-in a spreadsheet. Each run resumes from the last processed Drive item so the script can be scheduled as a time-based trigger without duplicating uploads.
+This Apps Script scans Google Drive for supported image files and uploads them to Google Photos while keeping track of progress in a spreadsheet. Each run resumes from the last processed Drive item so the script can be scheduled as a time-based trigger without duplicating uploads.
+
+## Features
+
+* **Incremental Drive scanning:** Uses the Drive API change tokens stored in script properties to resume where the previous run stopped.
+* **Batch-controlled uploads:** Processes items in configurable batches so triggers stay within Apps Script execution limits.
+* **Automatic album management:** Creates or reuses a Google Photos album and logs progress to a spreadsheet for auditability.
+
+## How it works
+
+The main entry point is [`runDriveToPhotosSync`](main.gs), which orchestrates the following steps:
+
+1. Load configuration constants (album name, spreadsheet name, batch size) and persisted cursor information.
+2. Retrieve Drive files that match the supported MIME types (JPEG, PNG, WEBP, HEIC/HEIF, AVIF).
+3. Upload each file to Google Photos using the Photos Library Advanced Service and add it to the target album.
+4. Record successes, skips, and failures in a Google Sheet for historical tracking.
+5. Persist the Drive cursor and album ID so future executions continue seamlessly.
+
+Because all OAuth credentials are managed by the Apps Script runtime via `ScriptApp.getOAuthToken()`, no secrets need to be stored in the repository.
 
 ## Prerequisites
 
@@ -52,3 +69,14 @@ in a spreadsheet. Each run resumes from the last processed Drive item so the scr
 * If you see `Upload failed` messages, the script will retry automatically for transient errors. Non-retryable failures are written to the log sheet so the file is not retried.
 * To restart the import from the beginning, clear the `DRIVE_CURSOR_TOKEN`, `DRIVE_CURSOR_INDEX`, and `ALBUM_ID` entries under **Project Settings → Script properties** and delete the rows (except the header) from the log sheet.
 * When changing scopes or APIs, re-run the script to accept new authorizations.
+
+## Contributing
+
+We welcome improvements! Please read the [contribution guidelines](CONTRIBUTING.md) for instructions on filing issues, proposing changes, and setting up development workflows. All contributors are expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Project governance
+
+* **License:** This project is available under the terms of the [MIT License](LICENSE).
+* **Security disclosures:** If you discover a vulnerability, please open a private issue or contact the maintainers directly rather than filing a public report.
+* **Community norms:** Review the [Code of Conduct](CODE_OF_CONDUCT.md) before participating in discussions or pull requests.
+
