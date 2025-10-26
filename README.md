@@ -1,0 +1,67 @@
+# Google Drive to Google Photos Importer
+
+This Apps Script scans Google Drive for supported image files and uploads them to Google Photos while keeping track of progress
+in a spreadsheet. Each run resumes from the last processed Drive item so the script can be scheduled as a time-based trigger without duplicating uploads.
+
+## Prerequisites
+
+* A Google account with access to Google Drive and Google Photos.
+* Permission to create Google Cloud projects (required to enable the Google Photos Library API).
+* The Google Apps Script project must use the **Drive API** advanced service and the **Google Photos Library API**.
+
+## Set up the Apps Script project
+
+1. Open [script.google.com](https://script.google.com) and create a **New project**.
+2. Replace the default `Code.gs` contents with the script from [`main.gs`](main.gs). You can rename the file if desired.
+3. Adjust the configuration constants at the top of the file (album name, batch size, etc.) to suit your workflow.
+
+### Enable required services
+
+1. In the Apps Script editor, open **Services** (the `+` icon next to "Services" in the left sidebar).
+2. Search for **Drive API** and add it. This exposes `Drive.Files.list` used by the script.
+3. Open **Project Settings → Google Cloud Platform (GCP) Project** and click **Change project** → **Create a project** (or **View API console** if one already exists). Note the project number.
+
+### Configure the Google Cloud project
+
+1. Visit [console.cloud.google.com](https://console.cloud.google.com) and switch to the project linked to your Apps Script deployment (use the project number noted above).
+2. Enable the **Google Photos Library API** and **Google Drive API** from **APIs & Services → Enabled APIs & services** → **+ Enable APIs and Services**.
+3. Under **APIs & Services → OAuth consent screen**:
+   1. Choose **Internal** or **External** depending on your account type.
+   2. Populate the application name, support email, and developer contact email.
+   3. Add the default Apps Script scopes if prompted (`https://www.googleapis.com/auth/drive.readonly`, `https://www.googleapis.com/auth/photoslibrary.appendonly`, `https://www.googleapis.com/auth/photoslibrary.sharing`, and Spreadsheet scopes).
+   4. Add any Google accounts that will run the script as **Test users** if the consent screen is left in testing mode.
+4. No OAuth client IDs or secrets are required—the Apps Script runtime manages tokens automatically once the APIs are enabled.
+
+### Authorize and run the script
+
+1. Back in Apps Script, open **Triggers** and create a time-driven trigger if you want the sync to run on a schedule (for example, every hour). You can also run it manually.
+2. Run the `runDriveToPhotosSync` function once from the editor. Apps Script will prompt you to authorize the script with the necessary scopes (`https://www.googleapis.com/auth/drive.readonly`, `https://www.googleapis.com/auth/photoslibrary.appendonly`, `https://www.googleapis.com/auth/photoslibrary.sharing`, and Spreadsheet scopes for logging).
+3. When prompted, choose **Advanced** → **Go to *Project name*** to complete authorization if Google flags the project as unverified during testing mode.
+4. The first successful run will create a spreadsheet named `Drive to Photos Upload Log` (or your customized name) and store its ID in script properties for future runs.
+5. Subsequent executions resume from where the last run stopped. Progress and error information is written to the log sheet and Apps Script execution logs.
+
+## Operational notes
+
+* The script only uploads files whose MIME type matches the supported list (JPEG, PNG, WEBP, HEIC/HEIF, and AVIF). Unsupported files are skipped and reported in the execution log.
+* Uploads stop when `BATCH_SIZE` items are uploaded, when the ~4.5 minute safety runtime is reached (leaving buffer for clean shutdown), or when a retryable error occurs. Cursor progress is saved throughout each run so long executions resume close to where they stopped and keep the Apps Script trigger healthy.
+* Update `ALBUM_NAME` to control the Google Photos album used for imports. The album is created automatically if it does not exist.
+* Execution logs include periodic progress updates. Use Apps Script's execution log viewer to monitor run details.
+
+## Preparing the project for public release
+
+Before publishing this project publicly (for example, on GitHub), review the following checklist to make sure you are not exposing personal information or configuration that should stay private:
+
+* Replace the default time zone in [`appsscript.json`](appsscript.json) with `Etc/UTC` (or remove the file entirely) if your private project used a location-specific setting.
+* Audit the configuration constants at the top of [`main.gs`](main.gs) to ensure album names, spreadsheet titles, or other identifiers do not reveal private details about your Drive organization.
+* Clear out script properties (`ALBUM_ID`, `DRIVE_CURSOR_TOKEN`, `DRIVE_CURSOR_INDEX`) and remove any generated spreadsheet before committing to a public repository. These values are re-created automatically on first run and may contain IDs from your personal Google account.
+* Double-check the Apps Script execution log and the rows stored in your log spreadsheet for file names you do not want to share publicly.
+* Review the OAuth scopes defined in `appsscript.json` and remove any that are not required by your public version of the script.
+* If you generated a clasp (`.clasp.json`) file or other deployment metadata, remove it before publishing to avoid leaking project IDs.
+
+The script does not embed any API keys or client secrets—the OAuth flows are handled by Apps Script at runtime—so publishing the source code is safe once the items above are addressed.
+
+## Troubleshooting
+
+* If you see `Upload failed` messages, the script will retry automatically for transient errors. Non-retryable failures are written to the log sheet so the file is not retried.
+* To restart the import from the beginning, clear the `DRIVE_CURSOR_TOKEN`, `DRIVE_CURSOR_INDEX`, and `ALBUM_ID` entries under **Project Settings → Script properties** and delete the rows (except the header) from the log sheet.
+* When changing scopes or APIs, re-run the script to accept new authorizations.
