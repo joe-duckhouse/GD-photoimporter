@@ -47,19 +47,6 @@ in a spreadsheet. Each run resumes from the last processed Drive item so the scr
 * Update `ALBUM_NAME` to control the Google Photos album used for imports. The album is created automatically if it does not exist.
 * Execution logs include periodic progress updates. Use Apps Script's execution log viewer to monitor run details.
 
-## Preparing the project for public release
-
-Before publishing this project publicly (for example, on GitHub), review the following checklist to make sure you are not exposing personal information or configuration that should stay private:
-
-* Replace the default time zone in [`appsscript.json`](appsscript.json) with `Etc/UTC` (or remove the file entirely) if your private project used a location-specific setting.
-* Audit the configuration constants at the top of [`main.gs`](main.gs) to ensure album names, spreadsheet titles, or other identifiers do not reveal private details about your Drive organization.
-* Clear out script properties (`ALBUM_ID`, `DRIVE_CURSOR_TOKEN`, `DRIVE_CURSOR_INDEX`) and remove any generated spreadsheet before committing to a public repository. These values are re-created automatically on first run and may contain IDs from your personal Google account.
-* Double-check the Apps Script execution log and the rows stored in your log spreadsheet for file names you do not want to share publicly.
-* Review the OAuth scopes defined in `appsscript.json` and remove any that are not required by your public version of the script.
-* If you generated a clasp (`.clasp.json`) file or other deployment metadata, remove it before publishing to avoid leaking project IDs.
-
-The script does not embed any API keys or client secrets—the OAuth flows are handled by Apps Script at runtime—so publishing the source code is safe once the items above are addressed.
-
 ## Troubleshooting
 
 * If you see `Upload failed` messages, the script will retry automatically for transient errors. Non-retryable failures are written to the log sheet so the file is not retried.
