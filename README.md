@@ -1,6 +1,7 @@
 # Google Drive to Google Photos Importer
 
-This Apps Script scans Google Drive for supported image files and uploads them to Google Photos while keeping track of progress in a spreadsheet. Each run resumes from the last processed Drive item so the script can be scheduled as a time-based trigger without duplicating uploads.
+This Apps Script scans Google Drive for supported image files and uploads them to Google Photos while keeping track of progress
+in a spreadsheet. Each run resumes from the last processed Drive item so the script can be scheduled as a time-based trigger without duplicating uploads.
 
 ## Prerequisites
 
@@ -19,16 +20,25 @@ This Apps Script scans Google Drive for supported image files and uploads them t
 1. In the Apps Script editor, open **Services** (the `+` icon next to "Services" in the left sidebar).
 2. Search for **Drive API** and add it. This exposes `Drive.Files.list` used by the script.
 3. Open **Project Settings → Google Cloud Platform (GCP) Project** and click **Change project** → **Create a project** (or **View API console** if one already exists). Note the project number.
-4. In the Google Cloud console for that project:
-   1. Enable the **Google Photos Library API** and **Google Drive API**.
-   2. Configure an OAuth consent screen (External or Internal) if prompted and publish it. The default scopes requested by Apps Script are sufficient.
+
+### Configure the Google Cloud project
+
+1. Visit [console.cloud.google.com](https://console.cloud.google.com) and switch to the project linked to your Apps Script deployment (use the project number noted above).
+2. Enable the **Google Photos Library API** and **Google Drive API** from **APIs & Services → Enabled APIs & services** → **+ Enable APIs and Services**.
+3. Under **APIs & Services → OAuth consent screen**:
+   1. Choose **Internal** or **External** depending on your account type.
+   2. Populate the application name, support email, and developer contact email.
+   3. Add the default Apps Script scopes if prompted (`https://www.googleapis.com/auth/drive.readonly`, `https://www.googleapis.com/auth/photoslibrary.appendonly`, `https://www.googleapis.com/auth/photoslibrary.sharing`, and Spreadsheet scopes).
+   4. Add any Google accounts that will run the script as **Test users** if the consent screen is left in testing mode.
+4. No OAuth client IDs or secrets are required—the Apps Script runtime manages tokens automatically once the APIs are enabled.
 
 ### Authorize and run the script
 
 1. Back in Apps Script, open **Triggers** and create a time-driven trigger if you want the sync to run on a schedule (for example, every hour). You can also run it manually.
 2. Run the `runDriveToPhotosSync` function once from the editor. Apps Script will prompt you to authorize the script with the necessary scopes (`https://www.googleapis.com/auth/drive.readonly`, `https://www.googleapis.com/auth/photoslibrary.appendonly`, `https://www.googleapis.com/auth/photoslibrary.sharing`, and Spreadsheet scopes for logging).
-3. The first successful run will create a spreadsheet named `Drive to Photos Upload Log` (or your customized name) and store its ID in script properties for future runs.
-4. Subsequent executions resume from where the last run stopped. Progress and error information is written to the log sheet and Apps Script execution logs.
+3. When prompted, choose **Advanced** → **Go to *Project name*** to complete authorization if Google flags the project as unverified during testing mode.
+4. The first successful run will create a spreadsheet named `Drive to Photos Upload Log` (or your customized name) and store its ID in script properties for future runs.
+5. Subsequent executions resume from where the last run stopped. Progress and error information is written to the log sheet and Apps Script execution logs.
 
 ## Operational notes
 
@@ -42,4 +52,3 @@ This Apps Script scans Google Drive for supported image files and uploads them t
 * If you see `Upload failed` messages, the script will retry automatically for transient errors. Non-retryable failures are written to the log sheet so the file is not retried.
 * To restart the import from the beginning, clear the `DRIVE_CURSOR_TOKEN`, `DRIVE_CURSOR_INDEX`, and `ALBUM_ID` entries under **Project Settings → Script properties** and delete the rows (except the header) from the log sheet.
 * When changing scopes or APIs, re-run the script to accept new authorizations.
-
