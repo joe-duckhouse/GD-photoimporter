@@ -61,6 +61,7 @@ function runDriveToPhotosSync() {
   var cursor = getDriveCursor_();
   var pageToken = cursor.pageToken;
   var offset = cursor.index;
+  var resumeFileId = cursor.fileId || '';
 
   var uploaded = 0;
   var seen = 0;
@@ -76,14 +77,24 @@ function runDriveToPhotosSync() {
   var startTimeMs = new Date().getTime();
   var lastPersistedToken = pageToken || '';
   var lastPersistedIndex = offset || 0;
+  var lastPersistedFileId = resumeFileId;
+  var nextCursorFileId = resumeFileId;
 
   /** Safely persists the cursor only when there is no in-flight upload work. */
-  function maybePersistCursor(currentToken, currentIndex) {
+  function maybePersistCursor(currentToken, currentIndex, currentFileId) {
     if (batchItems.length || pendingLogs.length) return;
-    if (currentToken === lastPersistedToken && currentIndex === lastPersistedIndex) return;
-    saveDriveCursor_(currentToken, currentIndex);
-    lastPersistedToken = currentToken;
-    lastPersistedIndex = currentIndex;
+    var normalizedToken = currentToken || '';
+    var normalizedIndex = currentIndex || 0;
+    var normalizedFileId = currentFileId || '';
+    if (normalizedToken === lastPersistedToken &&
+        normalizedIndex === lastPersistedIndex &&
+        normalizedFileId === lastPersistedFileId) {
+      return;
+    }
+    saveDriveCursor_(normalizedToken, normalizedIndex, normalizedFileId);
+    lastPersistedToken = normalizedToken;
+    lastPersistedIndex = normalizedIndex;
+    lastPersistedFileId = normalizedFileId;
   }
 
   Logger.log('Starting sync. Existing cursor: pageToken=' + (pageToken ? 'set' : 'unset') + ', index=' + offset + '.');
@@ -113,10 +124,28 @@ function runDriveToPhotosSync() {
     });
 
     var files = resp.items || [];
+    var hadResumeFileId = !!resumeFileId;
+    if (files.length && resumeFileId) {
+      var resumeIndex = -1;
+      for (var ri = 0; ri < files.length; ri++) {
+        if (files[ri].id === resumeFileId) {
+          resumeIndex = ri;
+          break;
+        }
+      }
+      offset = resumeIndex === -1 ? 0 : resumeIndex;
+      resumeFileId = '';
+    }
+    if (!hadResumeFileId && offset > 0) {
+      offset = 0;
+    }
     if (!files.length) {
       pageToken = resp.nextPageToken || '';
       offset = 0;
-      maybePersistCursor(pageToken, offset);
+      if (!pageToken) {
+        nextCursorFileId = '';
+      }
+      maybePersistCursor(pageToken, offset, nextCursorFileId);
       if (!pageToken) stop = true;
       continue;
     }
@@ -128,8 +157,9 @@ function runDriveToPhotosSync() {
       if (uploadedMap[fileId]) {
         offset = i + 1;
         skippedAlreadyLogged++;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
-        maybePersistCursor(requestToken || '', offset);
+        maybePersistCursor(requestToken || '', offset, nextCursorFileId);
         continue;
       }
 
@@ -137,8 +167,9 @@ function runDriveToPhotosSync() {
       if (!isSupportedMimeType_(mime)) {
         offset = i + 1;
         skippedUnsupportedMime++;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
-        maybePersistCursor(requestToken || '', offset);
+        maybePersistCursor(requestToken || '', offset, nextCursorFileId);
         continue;
       }
 
@@ -155,6 +186,7 @@ function runDriveToPhotosSync() {
         if (shouldRetryUpload) {
           pageToken = requestToken || '';
           offset = i;
+          nextCursorFileId = fileId;
           logProgressIfNeeded();
           stop = true;
           break;
@@ -162,8 +194,9 @@ function runDriveToPhotosSync() {
 
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
         offset = i + 1;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
-        maybePersistCursor(requestToken || '', offset);
+        maybePersistCursor(requestToken || '', offset, nextCursorFileId);
         continue;
       }
 
@@ -172,9 +205,11 @@ function runDriveToPhotosSync() {
         simpleMediaItem: { uploadToken: upload.token }
       });
       pendingLogs.push([fileId, name, mime, new Date(), null]);
-      pendingCursorRefs.push({ pageToken: requestToken || '', index: i });
+      pendingCursorRefs.push({ pageToken: requestToken || '', index: i, fileId: fileId });
 
       offset = i + 1;
+      nextCursorFileId = (offset < files.length) ? files[offset].id : '';
+      maybePersistCursor(requestToken || '', offset, nextCursorFileId);
 
       if (batchItems.length === PHOTOS_BATCH_LIMIT || uploaded + pendingLogs.length >= BATCH_SIZE) {
         var batchResult = createMediaItemsBatch_(batchItems, albumId);
@@ -200,12 +235,13 @@ function runDriveToPhotosSync() {
           Logger.log('Stopping after batchCreate error for "' + pendingLogs[failureIndex][1] + '": ' + failureMessage);
           pageToken = cursorRef ? cursorRef.pageToken : requestToken || '';
           offset = cursorRef ? cursorRef.index : i;
+          nextCursorFileId = cursorRef ? cursorRef.fileId || '' : '';
           stop = true;
         }
         batchItems = [];
         pendingLogs = [];
         pendingCursorRefs = [];
-        maybePersistCursor(pageToken, offset);
+        maybePersistCursor(pageToken, offset, nextCursorFileId);
         if (stop) break;
       }
 
@@ -213,6 +249,7 @@ function runDriveToPhotosSync() {
         Logger.log('Stopping early within page to avoid Apps Script timeout. Progress saved.');
         pageToken = requestToken || '';
         offset = i + 1;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         stop = true;
         break;
       }
@@ -220,6 +257,7 @@ function runDriveToPhotosSync() {
       if (uploaded >= BATCH_SIZE) {
         offset = i + 1;
         pageToken = requestToken || '';
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         stop = true;
         break;
       }
@@ -229,7 +267,8 @@ function runDriveToPhotosSync() {
 
     pageToken = resp.nextPageToken || '';
     offset = 0;
-    maybePersistCursor(pageToken, offset);
+    nextCursorFileId = '';
+    maybePersistCursor(pageToken, offset, nextCursorFileId);
     if (!pageToken) {
       stop = true;
     }
@@ -259,14 +298,15 @@ function runDriveToPhotosSync() {
       Logger.log('Stopping after final batchCreate error for "' + pendingLogs[remainingIndex][1] + '": ' + remainingMessage);
       pageToken = remainingCursor ? remainingCursor.pageToken : pageToken;
       offset = remainingCursor ? remainingCursor.index : offset;
+      nextCursorFileId = remainingCursor ? remainingCursor.fileId || '' : nextCursorFileId;
       stop = true;
     }
     pendingLogs = [];
     pendingCursorRefs = [];
-    maybePersistCursor(pageToken, offset);
+    maybePersistCursor(pageToken, offset, nextCursorFileId);
   }
 
-  saveDriveCursor_(pageToken, offset);
+  saveDriveCursor_(pageToken, offset, nextCursorFileId);
   Logger.log('Reviewed: ' + processed + ' Drive item(s). Attempted uploads: ' + seen + ', Uploaded: ' + uploaded + ' (this run). Skipped already logged: ' + skippedAlreadyLogged + ', Skipped unsupported mime: ' + skippedUnsupportedMime + '.');
 }
 
@@ -639,24 +679,35 @@ function getDriveCursor_() {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('DRIVE_CURSOR_TOKEN');
   var index = props.getProperty('DRIVE_CURSOR_INDEX');
+  var fileId = props.getProperty('DRIVE_CURSOR_FILE_ID');
   return {
     pageToken: token || '',
-    index: index ? Number(index) : 0
+    index: index ? Number(index) : 0,
+    fileId: fileId || ''
   };
 }
 
 /**
  * Persists the Drive cursor state used to resume future runs.
  */
-function saveDriveCursor_(pageToken, index) {
+function saveDriveCursor_(pageToken, index, fileId) {
   var props = PropertiesService.getScriptProperties();
-  if (!pageToken && !index) {
+  var token = pageToken || '';
+  var idx = (typeof index === 'number' && !isNaN(index)) ? index : Number(index) || 0;
+  var nextId = fileId || '';
+  if (!token && !idx && !nextId) {
     props.deleteProperty('DRIVE_CURSOR_TOKEN');
     props.deleteProperty('DRIVE_CURSOR_INDEX');
+    props.deleteProperty('DRIVE_CURSOR_FILE_ID');
     return;
   }
-  props.setProperty('DRIVE_CURSOR_TOKEN', pageToken || '');
-  props.setProperty('DRIVE_CURSOR_INDEX', index || 0);
+  props.setProperty('DRIVE_CURSOR_TOKEN', token);
+  props.setProperty('DRIVE_CURSOR_INDEX', String(idx || 0));
+  if (nextId) {
+    props.setProperty('DRIVE_CURSOR_FILE_ID', nextId);
+  } else {
+    props.deleteProperty('DRIVE_CURSOR_FILE_ID');
+  }
 }
 
 /* ===== CACHE HELPERS ===== */
