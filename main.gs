@@ -62,6 +62,7 @@ function runDriveToPhotosSync() {
   var pageToken = cursor.pageToken;
   var offset = cursor.index;
   var resumeFileId = cursor.fileId || '';
+  var resumeRealignAttempted = false;
 
   var uploaded = 0;
   var seen = 0;
@@ -125,7 +126,7 @@ function runDriveToPhotosSync() {
 
     var files = resp.items || [];
     var hadResumeFileId = !!resumeFileId;
-    if (files.length && resumeFileId) {
+    if (resumeFileId) {
       var resumeIndex = -1;
       for (var ri = 0; ri < files.length; ri++) {
         if (files[ri].id === resumeFileId) {
@@ -133,8 +134,30 @@ function runDriveToPhotosSync() {
           break;
         }
       }
-      offset = resumeIndex === -1 ? 0 : resumeIndex;
-      resumeFileId = '';
+
+      if (resumeIndex === -1) {
+        if (requestToken && !resumeRealignAttempted) {
+          Logger.log('Drive cursor misaligned for fileId ' + resumeFileId + '. Restarting from beginning.');
+          resumeRealignAttempted = true;
+          pageToken = '';
+          offset = 0;
+          continue;
+        }
+
+        if (resp.nextPageToken) {
+          pageToken = resp.nextPageToken;
+          offset = 0;
+          continue;
+        }
+
+        Logger.log('Drive cursor target ' + resumeFileId + ' no longer found. Resetting cursor to start.');
+        resumeFileId = '';
+        pageToken = '';
+        offset = 0;
+      } else {
+        offset = resumeIndex;
+        resumeFileId = '';
+      }
     }
     if (!hadResumeFileId && offset > 0) {
       offset = 0;
