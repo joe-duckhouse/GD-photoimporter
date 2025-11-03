@@ -65,6 +65,8 @@ function runDriveToPhotosSync() {
   var resumeFileId = cursor.fileId || '';
   var resumeRealignAttempted = false;
   var uploadFailureState = loadUploadFailureState_();
+  var loadedFailureKeys = uploadFailureState && uploadFailureState.counts ? Object.keys(uploadFailureState.counts) : [];
+  Logger.log('Loaded ' + loadedFailureKeys.length + ' upload failure record(s) from previous runs.');
 
   var uploaded = 0;
   var seen = 0;
@@ -119,6 +121,7 @@ function runDriveToPhotosSync() {
     }
 
     var requestToken = pageToken || null;
+    Logger.log('Listing Drive files (requestToken=' + (pageToken ? 'set' : 'unset') + ', offset=' + offset + ', fetchLimit=' + fetchLimit + ').');
     var resp = Drive.Files.list({
       q: getDriveMimeFilterQuery_(),
       orderBy: 'modifiedDate asc, title asc',
@@ -127,6 +130,7 @@ function runDriveToPhotosSync() {
     });
 
     var files = resp.items || [];
+    Logger.log('Fetched ' + files.length + ' item(s) from Drive (requestToken=' + (requestToken ? 'set' : 'unset') + ', nextPageToken=' + (resp.nextPageToken ? 'set' : 'unset') + ').');
     var hadResumeFileId = !!resumeFileId;
     if (resumeFileId) {
       var resumeIndex = -1;
@@ -139,7 +143,7 @@ function runDriveToPhotosSync() {
 
       if (resumeIndex === -1) {
         if (requestToken && !resumeRealignAttempted) {
-          Logger.log('Drive cursor misaligned for fileId ' + resumeFileId + '. Restarting from beginning.');
+          Logger.log('Drive cursor misaligned for fileId ' + resumeFileId + '. Restarting from beginning (requestToken was set).');
           resumeRealignAttempted = true;
           pageToken = '';
           offset = 0;
@@ -147,21 +151,24 @@ function runDriveToPhotosSync() {
         }
 
         if (resp.nextPageToken) {
+          Logger.log('Resume file ' + resumeFileId + ' not on current page. Advancing to next pageToken.');
           pageToken = resp.nextPageToken;
           offset = 0;
           continue;
         }
 
-        Logger.log('Drive cursor target ' + resumeFileId + ' no longer found. Resetting cursor to start.');
+        Logger.log('Drive cursor target ' + resumeFileId + ' no longer found anywhere. Resetting cursor to start.');
         resumeFileId = '';
         pageToken = '';
         offset = 0;
       } else {
+        Logger.log('Realigned cursor to resume file ' + resumeFileId + ' at index ' + resumeIndex + ' within current page.');
         offset = resumeIndex;
         resumeFileId = '';
       }
     }
     if (!hadResumeFileId && offset > 0) {
+      Logger.log('Resetting offset to 0 because resumeFileId was not set but offset remained at ' + offset + '.');
       offset = 0;
     }
     if (!files.length) {
@@ -180,6 +187,7 @@ function runDriveToPhotosSync() {
       processed++;
       var fileId = meta.id;
       if (uploadedMap[fileId]) {
+        Logger.log('Skipping already logged file "' + (meta.title || meta.originalFilename || fileId) + '" (' + fileId + ').');
         offset = i + 1;
         skippedAlreadyLogged++;
         nextCursorFileId = (offset < files.length) ? files[offset].id : '';
@@ -190,6 +198,7 @@ function runDriveToPhotosSync() {
 
       var mime = meta.mimeType || '';
       if (!isSupportedMimeType_(mime)) {
+        Logger.log('Skipping unsupported mime type for file "' + (meta.title || meta.originalFilename || fileId) + '" (' + fileId + '): ' + mime + '.');
         offset = i + 1;
         skippedUnsupportedMime++;
         nextCursorFileId = (offset < files.length) ? files[offset].id : '';
@@ -202,6 +211,12 @@ function runDriveToPhotosSync() {
       logProgressIfNeeded();
 
       var name = meta.title || meta.originalFilename || fileId;
+      var preExistingFailures = uploadFailureState && uploadFailureState.counts ? uploadFailureState.counts[fileId] || 0 : 0;
+      if (preExistingFailures > 0) {
+        Logger.log('Retrying upload for "' + name + '" (' + fileId + ') with existing failure count ' + preExistingFailures + '.');
+      } else {
+        Logger.log('Preparing upload for "' + name + '" (' + fileId + ') with mime type ' + mime + '.');
+      }
       var blob = DriveApp.getFileById(fileId).getBlob();
       var upload = uploadToPhotos_(blob, name);
       if (!upload.token) {
@@ -225,6 +240,7 @@ function runDriveToPhotosSync() {
             continue;
           }
 
+          Logger.log('Encountered retryable upload failure for "' + name + '". Will resume from same Drive page on next run.');
           pageToken = requestToken || '';
           offset = i;
           nextCursorFileId = fileId;
@@ -236,6 +252,7 @@ function runDriveToPhotosSync() {
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
         clearUploadFailure_(uploadFailureState, fileId);
         persistUploadFailureState_(uploadFailureState);
+        Logger.log('Logged non-retryable upload failure for "' + name + '" (' + fileId + ').');
         offset = i + 1;
         nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
@@ -245,6 +262,7 @@ function runDriveToPhotosSync() {
 
       clearUploadFailure_(uploadFailureState, fileId);
       persistUploadFailureState_(uploadFailureState);
+      Logger.log('Upload succeeded for "' + name + '" (' + fileId + '). Queuing for batch create.');
 
       batchItems.push({
         description: 'From Drive: ' + name,
@@ -258,6 +276,7 @@ function runDriveToPhotosSync() {
       maybePersistCursor(requestToken || '', offset, nextCursorFileId);
 
       if (batchItems.length === PHOTOS_BATCH_LIMIT || uploaded + pendingLogs.length >= BATCH_SIZE) {
+        Logger.log('Committing batch of ' + batchItems.length + ' upload(s) to Google Photos.');
         var batchResult = createMediaItemsBatch_(batchItems, albumId);
         if (batchResult === null) throw new Error('Failed to create Google Photos media items.');
         var logResult = logBatchResults_(sheet, pendingLogs, batchResult, uploadedMap);
@@ -321,6 +340,7 @@ function runDriveToPhotosSync() {
   }
 
   if (batchItems.length) {
+    Logger.log('Committing final batch of ' + batchItems.length + ' upload(s) to Google Photos.');
     var remainingResult = createMediaItemsBatch_(batchItems, albumId);
     if (remainingResult === null) throw new Error('Failed to create Google Photos media items.');
     var remainingLog = logBatchResults_(sheet, pendingLogs, remainingResult, uploadedMap);
