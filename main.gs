@@ -84,6 +84,7 @@ function runDriveToPhotosSync() {
   var lastPersistedIndex = offset || 0;
   var lastPersistedFileId = resumeFileId;
   var nextCursorFileId = resumeFileId;
+  var earliestRetryableFailure = null;
 
   /** Safely persists the cursor only when there is no in-flight upload work. */
   function maybePersistCursor(currentToken, currentIndex, currentFileId) {
@@ -240,13 +241,19 @@ function runDriveToPhotosSync() {
             continue;
           }
 
-          Logger.log('Encountered retryable upload failure for "' + name + '". Will resume from same Drive page on next run.');
-          pageToken = requestToken || '';
-          offset = i;
-          nextCursorFileId = fileId;
+          Logger.log('Encountered retryable upload failure for "' + name + '". Deferring but continuing with remaining Drive items this run.');
+          if (!earliestRetryableFailure) {
+            earliestRetryableFailure = {
+              pageToken: requestToken || '',
+              index: i,
+              fileId: fileId
+            };
+          }
+          offset = i + 1;
+          nextCursorFileId = (offset < files.length) ? files[offset].id : '';
           logProgressIfNeeded();
-          stop = true;
-          break;
+          maybePersistCursor(requestToken || '', offset, nextCursorFileId);
+          continue;
         }
 
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
@@ -370,6 +377,13 @@ function runDriveToPhotosSync() {
     pendingLogs = [];
     pendingCursorRefs = [];
     maybePersistCursor(pageToken, offset, nextCursorFileId);
+  }
+
+  if (earliestRetryableFailure) {
+    pageToken = earliestRetryableFailure.pageToken;
+    offset = earliestRetryableFailure.index;
+    nextCursorFileId = earliestRetryableFailure.fileId;
+    Logger.log('Will resume from deferred retryable failure ' + nextCursorFileId + ' on next run.');
   }
 
   persistUploadFailureState_(uploadFailureState);
