@@ -210,11 +210,14 @@ function runDriveToPhotosSync() {
         var shouldRetryUpload = !upload.error || upload.error.retryable !== false;
         if (shouldRetryUpload) {
           var failureCount = markUploadFailure_(uploadFailureState, fileId);
+          persistUploadFailureState_(uploadFailureState);
+          Logger.log('Upload failure count for "' + name + '" (' + fileId + '): ' + failureCount + '.');
           if (failureCount >= MAX_UPLOAD_RUN_FAILURES) {
             Logger.log('Giving up on "' + name + '" after ' + failureCount + ' failed upload attempt(s).');
             var finalMessage = uploadErrorMessage + ' (skipped after ' + failureCount + ' failed attempt(s))';
             logNonRetryableUploadFailure_(sheet, fileId, name, mime, finalMessage, uploadedMap);
             clearUploadFailure_(uploadFailureState, fileId);
+            persistUploadFailureState_(uploadFailureState);
             offset = i + 1;
             nextCursorFileId = (offset < files.length) ? files[offset].id : '';
             logProgressIfNeeded();
@@ -232,6 +235,7 @@ function runDriveToPhotosSync() {
 
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
         clearUploadFailure_(uploadFailureState, fileId);
+        persistUploadFailureState_(uploadFailureState);
         offset = i + 1;
         nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
@@ -240,6 +244,7 @@ function runDriveToPhotosSync() {
       }
 
       clearUploadFailure_(uploadFailureState, fileId);
+      persistUploadFailureState_(uploadFailureState);
 
       batchItems.push({
         description: 'From Drive: ' + name,
