@@ -16,6 +16,7 @@ var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
+var MAX_UPLOAD_RUN_FAILURES = 3; // retry runs before treating an item as failed
 var MAX_RUNTIME_MS = 4.5 * 60 * 1000; // exit early with buffer so time-driven triggers can restart
 /** MIME types that are eligible for upload to Google Photos. */
 var SUPPORTED_MIME_TYPES = [
@@ -63,6 +64,7 @@ function runDriveToPhotosSync() {
   var offset = cursor.index;
   var resumeFileId = cursor.fileId || '';
   var resumeRealignAttempted = false;
+  var uploadFailureState = loadUploadFailureState_();
 
   var uploaded = 0;
   var seen = 0;
@@ -207,6 +209,19 @@ function runDriveToPhotosSync() {
         Logger.log('Upload failed for "' + name + '": ' + uploadErrorMessage);
         var shouldRetryUpload = !upload.error || upload.error.retryable !== false;
         if (shouldRetryUpload) {
+          var failureCount = markUploadFailure_(uploadFailureState, fileId);
+          if (failureCount >= MAX_UPLOAD_RUN_FAILURES) {
+            Logger.log('Giving up on "' + name + '" after ' + failureCount + ' failed upload attempt(s).');
+            var finalMessage = uploadErrorMessage + ' (skipped after ' + failureCount + ' failed attempt(s))';
+            logNonRetryableUploadFailure_(sheet, fileId, name, mime, finalMessage, uploadedMap);
+            clearUploadFailure_(uploadFailureState, fileId);
+            offset = i + 1;
+            nextCursorFileId = (offset < files.length) ? files[offset].id : '';
+            logProgressIfNeeded();
+            maybePersistCursor(requestToken || '', offset, nextCursorFileId);
+            continue;
+          }
+
           pageToken = requestToken || '';
           offset = i;
           nextCursorFileId = fileId;
@@ -216,12 +231,15 @@ function runDriveToPhotosSync() {
         }
 
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
+        clearUploadFailure_(uploadFailureState, fileId);
         offset = i + 1;
         nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
         maybePersistCursor(requestToken || '', offset, nextCursorFileId);
         continue;
       }
+
+      clearUploadFailure_(uploadFailureState, fileId);
 
       batchItems.push({
         description: 'From Drive: ' + name,
@@ -329,6 +347,7 @@ function runDriveToPhotosSync() {
     maybePersistCursor(pageToken, offset, nextCursorFileId);
   }
 
+  persistUploadFailureState_(uploadFailureState);
   saveDriveCursor_(pageToken, offset, nextCursorFileId);
   Logger.log('Reviewed: ' + processed + ' Drive item(s). Attempted uploads: ' + seen + ', Uploaded: ' + uploaded + ' (this run). Skipped already logged: ' + skippedAlreadyLogged + ', Skipped unsupported mime: ' + skippedUnsupportedMime + '.');
 }
@@ -731,6 +750,66 @@ function saveDriveCursor_(pageToken, index, fileId) {
   } else {
     props.deleteProperty('DRIVE_CURSOR_FILE_ID');
   }
+}
+
+/** Loads the persisted per-file upload failure counters. */
+function loadUploadFailureState_() {
+  var props = PropertiesService.getScriptProperties();
+  var raw = props.getProperty('UPLOAD_FAILURE_COUNTS');
+  if (!raw) return { counts: {}, dirty: false };
+  try {
+    var parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { counts: {}, dirty: false };
+    var counts = {};
+    for (var key in parsed) {
+      if (parsed.hasOwnProperty(key)) {
+        var value = Number(parsed[key]);
+        if (!isNaN(value) && value > 0) {
+          counts[key] = Math.floor(value);
+        }
+      }
+    }
+    return { counts: counts, dirty: false };
+  } catch (e) {
+    return { counts: {}, dirty: false };
+  }
+}
+
+/** Increments and returns the failure count for a file ID. */
+function markUploadFailure_(state, fileId) {
+  if (!state || !fileId) return 0;
+  var counts = state.counts;
+  var next = (counts[fileId] || 0) + 1;
+  counts[fileId] = next;
+  state.dirty = true;
+  return next;
+}
+
+/** Clears any persisted upload failure count for a file ID. */
+function clearUploadFailure_(state, fileId) {
+  if (!state || !fileId) return;
+  if (state.counts.hasOwnProperty(fileId)) {
+    delete state.counts[fileId];
+    state.dirty = true;
+  }
+}
+
+/** Persists the upload failure counters if they have changed. */
+function persistUploadFailureState_(state) {
+  if (!state || !state.dirty) return;
+  var props = PropertiesService.getScriptProperties();
+  var keys = [];
+  for (var key in state.counts) {
+    if (state.counts.hasOwnProperty(key)) {
+      keys.push(key);
+    }
+  }
+  if (!keys.length) {
+    props.deleteProperty('UPLOAD_FAILURE_COUNTS');
+  } else {
+    props.setProperty('UPLOAD_FAILURE_COUNTS', JSON.stringify(state.counts));
+  }
+  state.dirty = false;
 }
 
 /* ===== CACHE HELPERS ===== */
