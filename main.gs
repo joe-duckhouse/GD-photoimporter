@@ -16,6 +16,7 @@ var LOG_SHEET_NAME = 'Log';
 var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
+var MAX_UPLOAD_RUN_FAILURES = 3; // retry runs before treating an item as failed
 var MAX_RUNTIME_MS = 4.5 * 60 * 1000; // exit early with buffer so time-driven triggers can restart
 /** MIME types that are eligible for upload to Google Photos. */
 var SUPPORTED_MIME_TYPES = [
@@ -61,6 +62,9 @@ function runDriveToPhotosSync() {
   var cursor = getDriveCursor_();
   var pageToken = cursor.pageToken;
   var offset = cursor.index;
+  var resumeFileId = cursor.fileId || '';
+  var resumeRealignAttempted = false;
+  var uploadFailureState = loadUploadFailureState_();
 
   var uploaded = 0;
   var seen = 0;
@@ -76,14 +80,24 @@ function runDriveToPhotosSync() {
   var startTimeMs = new Date().getTime();
   var lastPersistedToken = pageToken || '';
   var lastPersistedIndex = offset || 0;
+  var lastPersistedFileId = resumeFileId;
+  var nextCursorFileId = resumeFileId;
 
   /** Safely persists the cursor only when there is no in-flight upload work. */
-  function maybePersistCursor(currentToken, currentIndex) {
+  function maybePersistCursor(currentToken, currentIndex, currentFileId) {
     if (batchItems.length || pendingLogs.length) return;
-    if (currentToken === lastPersistedToken && currentIndex === lastPersistedIndex) return;
-    saveDriveCursor_(currentToken, currentIndex);
-    lastPersistedToken = currentToken;
-    lastPersistedIndex = currentIndex;
+    var normalizedToken = currentToken || '';
+    var normalizedIndex = currentIndex || 0;
+    var normalizedFileId = currentFileId || '';
+    if (normalizedToken === lastPersistedToken &&
+        normalizedIndex === lastPersistedIndex &&
+        normalizedFileId === lastPersistedFileId) {
+      return;
+    }
+    saveDriveCursor_(normalizedToken, normalizedIndex, normalizedFileId);
+    lastPersistedToken = normalizedToken;
+    lastPersistedIndex = normalizedIndex;
+    lastPersistedFileId = normalizedFileId;
   }
 
   Logger.log('Starting sync. Existing cursor: pageToken=' + (pageToken ? 'set' : 'unset') + ', index=' + offset + '.');
@@ -113,10 +127,50 @@ function runDriveToPhotosSync() {
     });
 
     var files = resp.items || [];
+    var hadResumeFileId = !!resumeFileId;
+    if (resumeFileId) {
+      var resumeIndex = -1;
+      for (var ri = 0; ri < files.length; ri++) {
+        if (files[ri].id === resumeFileId) {
+          resumeIndex = ri;
+          break;
+        }
+      }
+
+      if (resumeIndex === -1) {
+        if (requestToken && !resumeRealignAttempted) {
+          Logger.log('Drive cursor misaligned for fileId ' + resumeFileId + '. Restarting from beginning.');
+          resumeRealignAttempted = true;
+          pageToken = '';
+          offset = 0;
+          continue;
+        }
+
+        if (resp.nextPageToken) {
+          pageToken = resp.nextPageToken;
+          offset = 0;
+          continue;
+        }
+
+        Logger.log('Drive cursor target ' + resumeFileId + ' no longer found. Resetting cursor to start.');
+        resumeFileId = '';
+        pageToken = '';
+        offset = 0;
+      } else {
+        offset = resumeIndex;
+        resumeFileId = '';
+      }
+    }
+    if (!hadResumeFileId && offset > 0) {
+      offset = 0;
+    }
     if (!files.length) {
       pageToken = resp.nextPageToken || '';
       offset = 0;
-      maybePersistCursor(pageToken, offset);
+      if (!pageToken) {
+        nextCursorFileId = '';
+      }
+      maybePersistCursor(pageToken, offset, nextCursorFileId);
       if (!pageToken) stop = true;
       continue;
     }
@@ -128,8 +182,9 @@ function runDriveToPhotosSync() {
       if (uploadedMap[fileId]) {
         offset = i + 1;
         skippedAlreadyLogged++;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
-        maybePersistCursor(requestToken || '', offset);
+        maybePersistCursor(requestToken || '', offset, nextCursorFileId);
         continue;
       }
 
@@ -137,8 +192,9 @@ function runDriveToPhotosSync() {
       if (!isSupportedMimeType_(mime)) {
         offset = i + 1;
         skippedUnsupportedMime++;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
-        maybePersistCursor(requestToken || '', offset);
+        maybePersistCursor(requestToken || '', offset, nextCursorFileId);
         continue;
       }
 
@@ -153,28 +209,53 @@ function runDriveToPhotosSync() {
         Logger.log('Upload failed for "' + name + '": ' + uploadErrorMessage);
         var shouldRetryUpload = !upload.error || upload.error.retryable !== false;
         if (shouldRetryUpload) {
+          var failureCount = markUploadFailure_(uploadFailureState, fileId);
+          persistUploadFailureState_(uploadFailureState);
+          Logger.log('Upload failure count for "' + name + '" (' + fileId + '): ' + failureCount + '.');
+          if (failureCount >= MAX_UPLOAD_RUN_FAILURES) {
+            Logger.log('Giving up on "' + name + '" after ' + failureCount + ' failed upload attempt(s).');
+            var finalMessage = uploadErrorMessage + ' (skipped after ' + failureCount + ' failed attempt(s))';
+            logNonRetryableUploadFailure_(sheet, fileId, name, mime, finalMessage, uploadedMap);
+            clearUploadFailure_(uploadFailureState, fileId);
+            persistUploadFailureState_(uploadFailureState);
+            offset = i + 1;
+            nextCursorFileId = (offset < files.length) ? files[offset].id : '';
+            logProgressIfNeeded();
+            maybePersistCursor(requestToken || '', offset, nextCursorFileId);
+            continue;
+          }
+
           pageToken = requestToken || '';
           offset = i;
+          nextCursorFileId = fileId;
           logProgressIfNeeded();
           stop = true;
           break;
         }
 
         logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
+        clearUploadFailure_(uploadFailureState, fileId);
+        persistUploadFailureState_(uploadFailureState);
         offset = i + 1;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         logProgressIfNeeded();
-        maybePersistCursor(requestToken || '', offset);
+        maybePersistCursor(requestToken || '', offset, nextCursorFileId);
         continue;
       }
+
+      clearUploadFailure_(uploadFailureState, fileId);
+      persistUploadFailureState_(uploadFailureState);
 
       batchItems.push({
         description: 'From Drive: ' + name,
         simpleMediaItem: { uploadToken: upload.token }
       });
       pendingLogs.push([fileId, name, mime, new Date(), null]);
-      pendingCursorRefs.push({ pageToken: requestToken || '', index: i });
+      pendingCursorRefs.push({ pageToken: requestToken || '', index: i, fileId: fileId });
 
       offset = i + 1;
+      nextCursorFileId = (offset < files.length) ? files[offset].id : '';
+      maybePersistCursor(requestToken || '', offset, nextCursorFileId);
 
       if (batchItems.length === PHOTOS_BATCH_LIMIT || uploaded + pendingLogs.length >= BATCH_SIZE) {
         var batchResult = createMediaItemsBatch_(batchItems, albumId);
@@ -200,12 +281,13 @@ function runDriveToPhotosSync() {
           Logger.log('Stopping after batchCreate error for "' + pendingLogs[failureIndex][1] + '": ' + failureMessage);
           pageToken = cursorRef ? cursorRef.pageToken : requestToken || '';
           offset = cursorRef ? cursorRef.index : i;
+          nextCursorFileId = cursorRef ? cursorRef.fileId || '' : '';
           stop = true;
         }
         batchItems = [];
         pendingLogs = [];
         pendingCursorRefs = [];
-        maybePersistCursor(pageToken, offset);
+        maybePersistCursor(pageToken, offset, nextCursorFileId);
         if (stop) break;
       }
 
@@ -213,6 +295,7 @@ function runDriveToPhotosSync() {
         Logger.log('Stopping early within page to avoid Apps Script timeout. Progress saved.');
         pageToken = requestToken || '';
         offset = i + 1;
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         stop = true;
         break;
       }
@@ -220,6 +303,7 @@ function runDriveToPhotosSync() {
       if (uploaded >= BATCH_SIZE) {
         offset = i + 1;
         pageToken = requestToken || '';
+        nextCursorFileId = (offset < files.length) ? files[offset].id : '';
         stop = true;
         break;
       }
@@ -229,7 +313,8 @@ function runDriveToPhotosSync() {
 
     pageToken = resp.nextPageToken || '';
     offset = 0;
-    maybePersistCursor(pageToken, offset);
+    nextCursorFileId = '';
+    maybePersistCursor(pageToken, offset, nextCursorFileId);
     if (!pageToken) {
       stop = true;
     }
@@ -259,14 +344,16 @@ function runDriveToPhotosSync() {
       Logger.log('Stopping after final batchCreate error for "' + pendingLogs[remainingIndex][1] + '": ' + remainingMessage);
       pageToken = remainingCursor ? remainingCursor.pageToken : pageToken;
       offset = remainingCursor ? remainingCursor.index : offset;
+      nextCursorFileId = remainingCursor ? remainingCursor.fileId || '' : nextCursorFileId;
       stop = true;
     }
     pendingLogs = [];
     pendingCursorRefs = [];
-    maybePersistCursor(pageToken, offset);
+    maybePersistCursor(pageToken, offset, nextCursorFileId);
   }
 
-  saveDriveCursor_(pageToken, offset);
+  persistUploadFailureState_(uploadFailureState);
+  saveDriveCursor_(pageToken, offset, nextCursorFileId);
   Logger.log('Reviewed: ' + processed + ' Drive item(s). Attempted uploads: ' + seen + ', Uploaded: ' + uploaded + ' (this run). Skipped already logged: ' + skippedAlreadyLogged + ', Skipped unsupported mime: ' + skippedUnsupportedMime + '.');
 }
 
@@ -639,24 +726,95 @@ function getDriveCursor_() {
   var props = PropertiesService.getScriptProperties();
   var token = props.getProperty('DRIVE_CURSOR_TOKEN');
   var index = props.getProperty('DRIVE_CURSOR_INDEX');
+  var fileId = props.getProperty('DRIVE_CURSOR_FILE_ID');
   return {
     pageToken: token || '',
-    index: index ? Number(index) : 0
+    index: index ? Number(index) : 0,
+    fileId: fileId || ''
   };
 }
 
 /**
  * Persists the Drive cursor state used to resume future runs.
  */
-function saveDriveCursor_(pageToken, index) {
+function saveDriveCursor_(pageToken, index, fileId) {
   var props = PropertiesService.getScriptProperties();
-  if (!pageToken && !index) {
+  var token = pageToken || '';
+  var idx = (typeof index === 'number' && !isNaN(index)) ? index : Number(index) || 0;
+  var nextId = fileId || '';
+  if (!token && !idx && !nextId) {
     props.deleteProperty('DRIVE_CURSOR_TOKEN');
     props.deleteProperty('DRIVE_CURSOR_INDEX');
+    props.deleteProperty('DRIVE_CURSOR_FILE_ID');
     return;
   }
-  props.setProperty('DRIVE_CURSOR_TOKEN', pageToken || '');
-  props.setProperty('DRIVE_CURSOR_INDEX', index || 0);
+  props.setProperty('DRIVE_CURSOR_TOKEN', token);
+  props.setProperty('DRIVE_CURSOR_INDEX', String(idx || 0));
+  if (nextId) {
+    props.setProperty('DRIVE_CURSOR_FILE_ID', nextId);
+  } else {
+    props.deleteProperty('DRIVE_CURSOR_FILE_ID');
+  }
+}
+
+/** Loads the persisted per-file upload failure counters. */
+function loadUploadFailureState_() {
+  var props = PropertiesService.getScriptProperties();
+  var raw = props.getProperty('UPLOAD_FAILURE_COUNTS');
+  if (!raw) return { counts: {}, dirty: false };
+  try {
+    var parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { counts: {}, dirty: false };
+    var counts = {};
+    for (var key in parsed) {
+      if (parsed.hasOwnProperty(key)) {
+        var value = Number(parsed[key]);
+        if (!isNaN(value) && value > 0) {
+          counts[key] = Math.floor(value);
+        }
+      }
+    }
+    return { counts: counts, dirty: false };
+  } catch (e) {
+    return { counts: {}, dirty: false };
+  }
+}
+
+/** Increments and returns the failure count for a file ID. */
+function markUploadFailure_(state, fileId) {
+  if (!state || !fileId) return 0;
+  var counts = state.counts;
+  var next = (counts[fileId] || 0) + 1;
+  counts[fileId] = next;
+  state.dirty = true;
+  return next;
+}
+
+/** Clears any persisted upload failure count for a file ID. */
+function clearUploadFailure_(state, fileId) {
+  if (!state || !fileId) return;
+  if (state.counts.hasOwnProperty(fileId)) {
+    delete state.counts[fileId];
+    state.dirty = true;
+  }
+}
+
+/** Persists the upload failure counters if they have changed. */
+function persistUploadFailureState_(state) {
+  if (!state || !state.dirty) return;
+  var props = PropertiesService.getScriptProperties();
+  var keys = [];
+  for (var key in state.counts) {
+    if (state.counts.hasOwnProperty(key)) {
+      keys.push(key);
+    }
+  }
+  if (!keys.length) {
+    props.deleteProperty('UPLOAD_FAILURE_COUNTS');
+  } else {
+    props.setProperty('UPLOAD_FAILURE_COUNTS', JSON.stringify(state.counts));
+  }
+  state.dirty = false;
 }
 
 /* ===== CACHE HELPERS ===== */
