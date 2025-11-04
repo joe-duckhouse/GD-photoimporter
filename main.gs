@@ -13,7 +13,7 @@ var BATCH_SIZE = 200; // how many images to upload per run
 var ALBUM_NAME = 'From Google Drive';
 var LOG_SPREADSHEET_NAME = 'Drive to Photos Upload Log'; // spreadsheet title
 var LOG_SHEET_NAME = 'Log';
-var HEADERS = ['fileId', 'name', 'mimeType', 'uploadedAt', 'mediaItemId'];
+var HEADERS = ['fileId', 'name', 'drivePath', 'mimeType', 'uploadedAt', 'mediaItemId'];
 var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
 var MAX_UPLOAD_RUN_FAILURES = 3; // retry runs before treating an item as failed
@@ -212,13 +212,15 @@ function runDriveToPhotosSync() {
       logProgressIfNeeded();
 
       var name = meta.title || meta.originalFilename || fileId;
+      var driveFile = DriveApp.getFileById(fileId);
+      var drivePath = getDrivePathForFile_(driveFile, name);
       var preExistingFailures = uploadFailureState && uploadFailureState.counts ? uploadFailureState.counts[fileId] || 0 : 0;
       if (preExistingFailures > 0) {
         Logger.log('Retrying upload for "' + name + '" (' + fileId + ') with existing failure count ' + preExistingFailures + '.');
       } else {
         Logger.log('Preparing upload for "' + name + '" (' + fileId + ') with mime type ' + mime + '.');
       }
-      var blob = DriveApp.getFileById(fileId).getBlob();
+      var blob = driveFile.getBlob();
       var upload = uploadToPhotos_(blob, name);
       if (!upload.token) {
         var uploadErrorMessage = (upload.error && upload.error.message) ? upload.error.message : 'Unknown error';
@@ -231,7 +233,7 @@ function runDriveToPhotosSync() {
           if (failureCount >= MAX_UPLOAD_RUN_FAILURES) {
             Logger.log('Giving up on "' + name + '" after ' + failureCount + ' failed upload attempt(s).');
             var finalMessage = uploadErrorMessage + ' (skipped after ' + failureCount + ' failed attempt(s))';
-            logNonRetryableUploadFailure_(sheet, fileId, name, mime, finalMessage, uploadedMap);
+            logNonRetryableUploadFailure_(sheet, fileId, name, drivePath, mime, finalMessage, uploadedMap);
             clearUploadFailure_(uploadFailureState, fileId);
             persistUploadFailureState_(uploadFailureState);
             offset = i + 1;
@@ -256,7 +258,7 @@ function runDriveToPhotosSync() {
           continue;
         }
 
-        logNonRetryableUploadFailure_(sheet, fileId, name, mime, uploadErrorMessage, uploadedMap);
+        logNonRetryableUploadFailure_(sheet, fileId, name, drivePath, mime, uploadErrorMessage, uploadedMap);
         clearUploadFailure_(uploadFailureState, fileId);
         persistUploadFailureState_(uploadFailureState);
         Logger.log('Logged non-retryable upload failure for "' + name + '" (' + fileId + ').');
@@ -272,10 +274,10 @@ function runDriveToPhotosSync() {
       Logger.log('Upload succeeded for "' + name + '" (' + fileId + '). Queuing for batch create.');
 
       batchItems.push({
-        description: 'From Drive: ' + name,
+        description: 'From Drive: ' + name + ' (' + drivePath + ')',
         simpleMediaItem: { uploadToken: upload.token }
       });
-      pendingLogs.push([fileId, name, mime, new Date(), null]);
+      pendingLogs.push([fileId, name, drivePath, mime, new Date(), null]);
       pendingCursorRefs.push({ pageToken: requestToken || '', index: i, fileId: fileId });
 
       offset = i + 1;
@@ -691,7 +693,7 @@ function logBatchResults_(sheet, pendingLogs, result, uploadedMap) {
     var entry = pendingLogs[i];
     var mediaItemId = ids[i] || null;
     if (mediaItemId) {
-      entry[4] = mediaItemId;
+      entry[5] = mediaItemId;
       successRows.push(entry);
       if (uploadedMap) uploadedMap[entry[0]] = true;
       successes++;
@@ -706,7 +708,7 @@ function logBatchResults_(sheet, pendingLogs, result, uploadedMap) {
 
     var failureRow = entry.slice();
     var failureMessage = getBatchErrorMessage_(errors, i);
-    failureRow[4] = 'FAILED: ' + truncateString_(failureMessage, 200);
+    failureRow[5] = 'FAILED: ' + truncateString_(failureMessage, 200);
     failureRows.push(failureRow);
     skippedDetails.push({ index: i, name: entry[1], message: failureMessage });
     if (uploadedMap) uploadedMap[entry[0]] = true;
@@ -729,10 +731,63 @@ function logBatchResults_(sheet, pendingLogs, result, uploadedMap) {
 /**
  * Records a non-retryable upload failure in the log and marks the file as seen.
  */
-function logNonRetryableUploadFailure_(sheet, fileId, name, mime, message, uploadedMap) {
-  var row = [fileId, name, mime, new Date(), 'FAILED: ' + truncateString_(message, 200)];
+function logNonRetryableUploadFailure_(sheet, fileId, name, drivePath, mime, message, uploadedMap) {
+  var row = [fileId, name, drivePath, mime, new Date(), 'FAILED: ' + truncateString_(message, 200)];
   sheet.getRange(sheet.getLastRow() + 1, 1, 1, HEADERS.length).setValues([row]);
   if (uploadedMap) uploadedMap[fileId] = true;
+}
+
+/**
+ * Builds a human-readable Drive path for the provided file.
+ *
+ * @param {?GoogleAppsScript.Drive.File} file Drive file handle.
+ * @param {string} fallbackName Name to use when the file name is unavailable.
+ * @return {string} Joined folder path ending with the file name.
+ */
+function getDrivePathForFile_(file, fallbackName) {
+  if (!file) return fallbackName || '';
+
+  var segments = [];
+  var name = '';
+  try { name = file.getName(); } catch (e) {}
+  if (name) {
+    segments.push(name);
+  } else if (fallbackName) {
+    segments.push(fallbackName);
+  }
+
+  var parent = getFirstParentFolder_(file);
+  var guard = 0;
+  while (parent && guard < 50) {
+    var parentName = '';
+    try { parentName = parent.getName(); } catch (e) {}
+    if (parentName) segments.unshift(parentName);
+    try {
+      if (parent.isRootFolder && parent.isRootFolder()) break;
+    } catch (e) {}
+    parent = getFirstParentFolder_(parent);
+    guard++;
+  }
+
+  return segments.join('/') || (fallbackName || '');
+}
+
+/**
+ * Returns the first parent folder for a Drive item, if available.
+ *
+ * @param {?GoogleAppsScript.Drive.Folder|?GoogleAppsScript.Drive.File} entry Drive entry.
+ * @return {?GoogleAppsScript.Drive.Folder} First parent folder or null.
+ */
+function getFirstParentFolder_(entry) {
+  if (!entry || !entry.getParents) return null;
+  var parents;
+  try { parents = entry.getParents(); } catch (e) { return null; }
+  if (!parents) return null;
+  try {
+    return parents.hasNext() ? parents.next() : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 /**
