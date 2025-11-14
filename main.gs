@@ -52,12 +52,23 @@ function runDriveToPhotosSync() {
 
   var uploadedMap = buildUploadedMap_(sheet);
 
+  var albumIndex = getCachedAlbumIndex_();
   var albumId = getCachedAlbumId_();
+  var albumTitle = getAlbumTitleForIndex_(ALBUM_NAME, albumIndex);
   if (!albumId) {
-    albumId = getOrCreateAlbum_(ALBUM_NAME);
-    if (!albumId) throw new Error('Could not create or fetch album: ' + ALBUM_NAME);
-    cacheAlbumId_(albumId);
+    var initialAlbum = getOrCreateAlbumForIndex_(ALBUM_NAME, albumIndex);
+    if (!initialAlbum || !initialAlbum.id) {
+      throw new Error('Could not create or fetch album: ' + (initialAlbum ? initialAlbum.title : albumTitle));
+    }
+    albumId = initialAlbum.id;
+    albumIndex = initialAlbum.index;
+    albumTitle = initialAlbum.title;
+    cacheAlbumId_(albumId, albumIndex);
+  } else {
+    cacheAlbumId_(albumId, albumIndex);
   }
+
+  var albumState = { id: albumId, index: albumIndex, title: albumTitle };
 
   var cursor = getDriveCursor_();
   var pageToken = cursor.pageToken;
@@ -288,6 +299,10 @@ function runDriveToPhotosSync() {
         Logger.log('Committing batch of ' + batchItems.length + ' upload(s) to Google Photos.');
         var batchResult = createMediaItemsBatch_(batchItems, albumId);
         if (batchResult === null) throw new Error('Failed to create Google Photos media items.');
+        batchResult = resolveAlbumLimitErrors_(ALBUM_NAME, batchItems, batchResult, albumState);
+        albumId = albumState.id;
+        albumIndex = albumState.index;
+        albumTitle = albumState.title;
         var logResult = logBatchResults_(sheet, pendingLogs, batchResult, uploadedMap);
         uploaded += logResult.successes;
 
@@ -352,6 +367,10 @@ function runDriveToPhotosSync() {
     Logger.log('Committing final batch of ' + batchItems.length + ' upload(s) to Google Photos.');
     var remainingResult = createMediaItemsBatch_(batchItems, albumId);
     if (remainingResult === null) throw new Error('Failed to create Google Photos media items.');
+    remainingResult = resolveAlbumLimitErrors_(ALBUM_NAME, batchItems, remainingResult, albumState);
+    albumId = albumState.id;
+    albumIndex = albumState.index;
+    albumTitle = albumState.title;
     var remainingLog = logBatchResults_(sheet, pendingLogs, remainingResult, uploadedMap);
     uploaded += remainingLog.successes;
 
@@ -553,6 +572,79 @@ function createMediaItemsBatch_(items, albumId) {
 }
 
 /**
+ * Detects album capacity errors and retries affected uploads in a new album.
+ *
+ * @param {string} baseAlbumName Configured base album name.
+ * @param {!Array<!Object>} batchItems Upload requests for the current batch.
+ * @param {{ids: !Array, errors: !Array}} batchResult Result from batchCreate.
+ * @param {{id: string, index: number, title: string}} albumState Mutable album state.
+ * @return {{ids: !Array, errors: !Array}} Possibly updated batch result.
+ */
+function resolveAlbumLimitErrors_(baseAlbumName, batchItems, batchResult, albumState) {
+  if (!batchResult) return batchResult;
+  if (!batchResult.ids) batchResult.ids = [];
+  if (!batchResult.errors) batchResult.errors = [];
+
+  var limitIndexes = getAlbumLimitErrorIndexes_(batchResult.errors);
+  if (!limitIndexes.length) return batchResult;
+
+  var retryItems = [];
+  for (var i = 0; i < limitIndexes.length; i++) {
+    var batchItem = batchItems[limitIndexes[i]];
+    if (!batchItem) {
+      throw new Error('Unable to retry upload due to missing batch item at index ' + limitIndexes[i] + '.');
+    }
+    retryItems.push(batchItem);
+  }
+
+  var previousTitle = albumState && albumState.title ? albumState.title : getAlbumTitleForIndex_(baseAlbumName, 1);
+  var attempts = 0;
+  var maxAttempts = 10;
+  var retryResult = null;
+  var retryLimitIndexes = limitIndexes.slice();
+
+  while (retryLimitIndexes.length && attempts < maxAttempts) {
+    var nextAlbum = getOrCreateAlbumForIndex_(baseAlbumName, (albumState && typeof albumState.index === 'number' ? albumState.index : 1) + 1);
+    if (!nextAlbum || !nextAlbum.id) {
+      throw new Error('Unable to create a new Google Photos album after reaching the per-album limit.');
+    }
+
+    albumState.id = nextAlbum.id;
+    albumState.index = nextAlbum.index;
+    albumState.title = nextAlbum.title;
+    cacheAlbumId_(albumState.id, albumState.index);
+
+    Logger.log('Album "' + previousTitle + '" reached capacity. Continuing uploads in "' + albumState.title + '". Retrying ' + limitIndexes.length + ' item(s).');
+
+    retryResult = createMediaItemsBatch_(retryItems, albumState.id);
+    if (retryResult === null) {
+      throw new Error('Failed to create Google Photos media items after rotating albums.');
+    }
+
+    retryLimitIndexes = getAlbumLimitErrorIndexes_(retryResult.errors);
+    previousTitle = albumState.title;
+    attempts++;
+  }
+
+  if (retryLimitIndexes && retryLimitIndexes.length) {
+    throw new Error('Unable to find an available Google Photos album after multiple attempts due to per-album limits.');
+  }
+
+  if (!retryResult) return batchResult;
+
+  var retryIds = (retryResult && retryResult.ids) || [];
+  var retryErrors = (retryResult && retryResult.errors) || [];
+
+  for (var r = 0; r < limitIndexes.length; r++) {
+    var targetIndex = limitIndexes[r];
+    batchResult.ids[targetIndex] = retryIds.length > r ? retryIds[r] : null;
+    batchResult.errors[targetIndex] = retryErrors.length > r ? retryErrors[r] : null;
+  }
+
+  return batchResult;
+}
+
+/**
  * Checks whether the provided MIME type is allowlisted for upload.
  *
  * @param {string} mime MIME type from the Drive file metadata.
@@ -616,6 +708,32 @@ function getOrCreateAlbum_(name) {
     return json.id || null;
   }
   return null;
+}
+
+/**
+ * Computes the album title for a specific sequence index.
+ *
+ * @param {string} baseName Base album name from configuration.
+ * @param {number} index Sequence index (1-based).
+ * @return {string} Album title for the provided index.
+ */
+function getAlbumTitleForIndex_(baseName, index) {
+  if (typeof index !== 'number' || index <= 1) return baseName;
+  return baseName + ' (Part ' + index + ')';
+}
+
+/**
+ * Retrieves (or creates) the album corresponding to the provided index.
+ *
+ * @param {string} baseName Base album name from configuration.
+ * @param {number} index Sequence index (1-based).
+ * @return {{id: (string|null), index: number, title: string}} Album metadata.
+ */
+function getOrCreateAlbumForIndex_(baseName, index) {
+  if (typeof index !== 'number' || index < 1) index = 1;
+  var title = getAlbumTitleForIndex_(baseName, index);
+  var id = getOrCreateAlbum_(title);
+  return { id: id, index: index, title: title };
 }
 
 /* ===== LOGGING SUPPORT ===== */
@@ -911,9 +1029,26 @@ function persistUploadFailureState_(state) {
 function getCachedAlbumId_() {
   return PropertiesService.getScriptProperties().getProperty('ALBUM_ID');
 }
+/** Retrieves the cached album index or defaults to 1. */
+function getCachedAlbumIndex_() {
+  var raw = PropertiesService.getScriptProperties().getProperty('ALBUM_INDEX');
+  var parsed = parseInt(raw, 10);
+  if (isNaN(parsed) || parsed < 1) return 1;
+  return parsed;
+}
 /** Stores the album ID for reuse across sync runs. */
-function cacheAlbumId_(id) {
-  PropertiesService.getScriptProperties().setProperty('ALBUM_ID', id);
+function cacheAlbumId_(id, index) {
+  var props = PropertiesService.getScriptProperties();
+  if (id) {
+    props.setProperty('ALBUM_ID', id);
+  } else {
+    props.deleteProperty('ALBUM_ID');
+  }
+  if (typeof index === 'number' && index >= 1) {
+    props.setProperty('ALBUM_INDEX', String(index));
+  } else {
+    props.deleteProperty('ALBUM_INDEX');
+  }
 }
 
 /* ===== RETRY WITH BACKOFF ===== */
@@ -957,16 +1092,61 @@ function isRetryableStatusCode_(code) {
   return code >= 500 && code < 600;
 }
 
+/** Extracts a human-readable message from an error payload. */
+function getErrorMessageText_(error) {
+  if (!error) return '';
+  if (error.message) return error.message;
+  if (error.status) {
+    if (error.status.message) return error.status.message;
+    var details = error.status.details;
+    if (details) {
+      if (!Array.isArray(details)) details = [details];
+      for (var i = 0; i < details.length; i++) {
+        var detail = details[i];
+        if (!detail) continue;
+        if (detail.description) return detail.description;
+        if (detail.message) return detail.message;
+        if (detail.errorMessage) return detail.errorMessage;
+        if (detail.fieldViolations && detail.fieldViolations.length) {
+          for (var j = 0; j < detail.fieldViolations.length; j++) {
+            var violation = detail.fieldViolations[j];
+            if (violation && violation.description) return violation.description;
+          }
+        }
+      }
+    }
+  }
+  return '';
+}
+
 /** Derives a human-readable error message for a batchCreate entry. */
 function getBatchErrorMessage_(errors, index) {
   if (!errors || typeof index !== 'number' || index < 0 || index >= errors.length) {
     return 'Unknown error';
   }
   var entry = errors[index];
-  if (!entry) return 'Unknown error';
-  if (entry.message) return entry.message;
-  if (entry.status && entry.status.message) return entry.status.message;
-  return 'Unknown error';
+  var message = getErrorMessageText_(entry);
+  return message || 'Unknown error';
+}
+
+/** Determines whether an error indicates the per-album photo limit was hit. */
+function isAlbumFullError_(error) {
+  var message = getErrorMessageText_(error);
+  if (!message) return false;
+  var normalized = String(message).toUpperCase();
+  if (normalized.indexOf('ERR_PHOTO_PER_ALBUM_LIMIT') !== -1) return true;
+  if (normalized.indexOf('MAXIMUM NUMBER OF PHOTOS IN AN ALBUM') !== -1) return true;
+  return false;
+}
+
+/** Returns the indexes that encountered the per-album limit error. */
+function getAlbumLimitErrorIndexes_(errors) {
+  var indexes = [];
+  if (!errors) return indexes;
+  for (var i = 0; i < errors.length; i++) {
+    if (isAlbumFullError_(errors[i])) indexes.push(i);
+  }
+  return indexes;
 }
 
 /** Checks whether a batchCreate error warrants a retry. */

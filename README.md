@@ -62,6 +62,7 @@ Because all OAuth credentials are managed by the Apps Script runtime via `Script
 * The script only uploads files whose MIME type matches the supported list (JPEG, PNG, WEBP, HEIC/HEIF, and AVIF). Unsupported files are skipped and reported in the execution log.
 * Uploads stop when `BATCH_SIZE` items are uploaded, when the ~4.5 minute safety runtime is reached (leaving buffer for clean shutdown), or when a retryable error occurs. Cursor progress is saved throughout each run so long executions resume close to where they stopped and keep the Apps Script trigger healthy.
 * Update `ALBUM_NAME` to control the Google Photos album used for imports. The album is created automatically if it does not exist.
+* When a Google Photos album reaches the 20,000 item limit, the script automatically creates the next "part" album (for example, `From Google Drive (Part 2)`) and retries the affected uploads there.
 * Execution logs include periodic progress updates. Use Apps Script's execution log viewer to monitor run details.
 
 ## Troubleshooting
