@@ -18,6 +18,7 @@ var PHOTOS_BATCH_LIMIT = 50; // Google Photos batchCreate limit
 var PROGRESS_LOG_INTERVAL = 10; // how often to log progress while scanning Drive
 var MAX_UPLOAD_RUN_FAILURES = 3; // retry runs before treating an item as failed
 var MAX_RUNTIME_MS = 4.5 * 60 * 1000; // exit early with buffer so time-driven triggers can restart
+var BACKFILL_BATCH_SIZE = 50; // legacy entries to update per backfill run
 /** MIME types that are eligible for upload to Google Photos. */
 var SUPPORTED_MIME_TYPES = [
   'image/jpeg',
@@ -35,6 +36,13 @@ var SUPPORTED_MIME_TYPE_LOOKUP = (function () {
   }
   return lookup;
 })();
+
+/**
+ * Builds the Google Photos description for an imported Drive item.
+ */
+function buildDriveDescription_(name, drivePath) {
+  return 'From Drive: ' + (name || '') + ' (' + (drivePath || '') + ')';
+}
 
 /* ===== ENTRYPOINT ===== */
 /**
@@ -285,7 +293,7 @@ function runDriveToPhotosSync() {
       Logger.log('Upload succeeded for "' + name + '" (' + fileId + '). Queuing for batch create.');
 
       batchItems.push({
-        description: 'From Drive: ' + name + ' (' + drivePath + ')',
+        description: buildDriveDescription_(name, drivePath),
         simpleMediaItem: { uploadToken: upload.token }
       });
       pendingLogs.push([fileId, name, drivePath, mime, new Date(), null]);
@@ -410,6 +418,80 @@ function runDriveToPhotosSync() {
   persistUploadFailureState_(uploadFailureState);
   saveDriveCursor_(pageToken, offset, nextCursorFileId);
   Logger.log('Reviewed: ' + processed + ' Drive item(s). Attempted uploads: ' + seen + ', Uploaded: ' + uploaded + ' (this run). Skipped already logged: ' + skippedAlreadyLogged + ', Skipped unsupported mime: ' + skippedUnsupportedMime + '.');
+}
+
+/**
+ * Backfills missing Drive path metadata and updates Google Photos descriptions.
+ *
+ * Scans the log sheet for entries with empty Drive paths but successful
+ * Google Photos media item IDs. Each run updates up to BACKFILL_BATCH_SIZE
+ * legacy rows to avoid hitting Apps Script execution limits.
+ */
+function runMissingDrivePathBackfill() {
+  var sheet = getLogSheet_();
+  ensureHeaders_(sheet);
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('No log entries available for backfill.');
+    return;
+  }
+
+  var values = sheet.getRange(2, 1, lastRow - 1, HEADERS.length).getValues();
+  var updates = 0;
+  var scanned = 0;
+  var skippedExistingPath = 0;
+  var skippedMissingMediaItem = 0;
+  var skippedMissingPath = 0;
+  var failedUpdates = 0;
+
+  for (var i = 0; i < values.length; i++) {
+    if (updates >= BACKFILL_BATCH_SIZE) {
+      Logger.log('Reached BACKFILL_BATCH_SIZE limit of ' + BACKFILL_BATCH_SIZE + ' update(s) for this run.');
+      break;
+    }
+
+    scanned++;
+    var row = values[i];
+    var fileId = row[0];
+    var name = row[1];
+    var existingPath = trimString_(row[2]);
+    var mediaItemId = trimString_(row[5]);
+
+    if (!mediaItemId || mediaItemId.indexOf('FAILED:') === 0) {
+      skippedMissingMediaItem++;
+      continue;
+    }
+
+    if (existingPath) {
+      skippedExistingPath++;
+      continue;
+    }
+
+    var resolvedPath = resolveDrivePathForFileId_(fileId, name);
+    if (!trimString_(resolvedPath)) {
+      Logger.log('Unable to determine Drive path for "' + (name || fileId) + '" (' + fileId + '). Skipping.');
+      skippedMissingPath++;
+      continue;
+    }
+
+    var description = buildDriveDescription_(name, resolvedPath);
+    var result = updateMediaItemDescription_(mediaItemId, description);
+    if (!result.success) {
+      failedUpdates++;
+      Logger.log('Failed to update description for media item ' + mediaItemId + ': ' + (result.message || 'Unknown error') + '.');
+      if (result.retryable) {
+        Logger.log('The update for media item ' + mediaItemId + ' can be retried in a later run.');
+      }
+      continue;
+    }
+
+    sheet.getRange(i + 2, 3).setValue(resolvedPath);
+    updates++;
+    Logger.log('Updated description for media item ' + mediaItemId + ' with Drive path "' + resolvedPath + '".');
+  }
+
+  Logger.log('Backfill summary: scanned ' + scanned + ' row(s), updated ' + updates + ', skipped existing path: ' + skippedExistingPath + ', skipped missing media item: ' + skippedMissingMediaItem + ', skipped without path: ' + skippedMissingPath + ', failed updates: ' + failedUpdates + '.');
 }
 
 /**
@@ -569,6 +651,77 @@ function createMediaItemsBatch_(items, albumId) {
   }
 
   return { ids: ids, errors: errors };
+}
+
+/**
+ * Updates the description for an existing Google Photos media item.
+ */
+function updateMediaItemDescription_(mediaItemId, description) {
+  if (!mediaItemId) {
+    return { success: false, retryable: false, message: 'Missing media item ID.' };
+  }
+
+  var url = 'https://photoslibrary.googleapis.com/v1/mediaItems/' + encodeURIComponent(mediaItemId) + '?updateMask=description';
+  var payload = { description: description || '' };
+
+  var resp = fetchWithRetry_(function () {
+    return UrlFetchApp.fetch(url, {
+      method: 'patch',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(payload)
+    });
+  }, 5, 1000, function (r) {
+    var c = r.getResponseCode();
+    return c >= 200 && c < 300;
+  });
+
+  if (!resp) {
+    return { success: false, retryable: true, message: 'No response from mediaItems.patch after retries.' };
+  }
+
+  if (!resp.getResponseCode) {
+    return { success: false, retryable: true, message: 'mediaItems.patch did not return a response code.' };
+  }
+
+  var code = resp.getResponseCode();
+  if (code >= 200 && code < 300) {
+    return { success: true, retryable: false, message: '' };
+  }
+
+  var bodyText = resp.getContentText ? resp.getContentText() : '';
+  var message = 'HTTP ' + code;
+  var retryable = isRetryableStatusCode_(code);
+
+  if (bodyText) {
+    try {
+      var json = JSON.parse(bodyText);
+      if (json && json.error) {
+        var errorMessage = getErrorMessageText_(json.error);
+        if (errorMessage) message = errorMessage;
+        if (typeof json.error.code === 'number') {
+          retryable = retryable || isRetryableStatusCode_(json.error.code);
+        }
+        if (json.error.status) {
+          var statusText = String(json.error.status).toUpperCase();
+          if (statusText === 'RESOURCE_EXHAUSTED' || statusText === 'UNAVAILABLE' || statusText === 'ABORTED') {
+            retryable = true;
+          }
+        }
+      } else if (json && json.message) {
+        message = json.message;
+      } else {
+        message = message + ' - ' + truncateString_(bodyText, 200);
+      }
+    } catch (e) {
+      message = message + ' - ' + truncateString_(bodyText, 200);
+    }
+  }
+
+  return { success: false, retryable: retryable, message: message };
 }
 
 /**
@@ -891,6 +1044,19 @@ function getDrivePathForFile_(file, fallbackName) {
 }
 
 /**
+ * Resolves the Drive path for a file ID, skipping entries that cannot be read.
+ */
+function resolveDrivePathForFileId_(fileId, fallbackName) {
+  if (!fileId) return '';
+  try {
+    var file = DriveApp.getFileById(fileId);
+    return getDrivePathForFile_(file, fallbackName);
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
  * Returns the first parent folder for a Drive item, if available.
  *
  * @param {?GoogleAppsScript.Drive.Folder|?GoogleAppsScript.Drive.File} entry Drive entry.
@@ -1083,6 +1249,12 @@ function truncateString_(value, maxLength) {
   if (!value) return '';
   if (value.length <= maxLength) return value;
   return value.substring(0, maxLength) + '...';
+}
+
+/** Trims leading/trailing whitespace from a string value. */
+function trimString_(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/^\s+|\s+$/g, '');
 }
 
 /** Determines if an HTTP status code is safe to retry. */
