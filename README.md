@@ -65,6 +65,16 @@ Because all OAuth credentials are managed by the Apps Script runtime via `Script
 * When a Google Photos album reaches the 20,000 item limit, the script automatically creates the next "part" album (for example, `From Google Drive (Part 2)`) and retries the affected uploads there.
 * Execution logs include periodic progress updates. Use Apps Script's execution log viewer to monitor run details.
 
+### Backfill legacy descriptions
+
+If you uploaded photos before Drive path metadata was added to descriptions, run the `runMissingDrivePathBackfill` function. Each execution updates up to `BACKFILL_BATCH_SIZE` log entries that are missing a Drive path by:
+
+1. Looking up the current Drive folder path for the logged file ID.
+2. Updating the corresponding Google Photos media item description to include the path.
+3. Recording the resolved path in the log sheet so future runs skip the entry.
+
+Repeat the backfill until the execution log reports zero remaining updates. The process runs independently of the main importer, so you can schedule or trigger it separately without affecting ongoing uploads.
+
 ## Troubleshooting
 
 * If you see `Upload failed` messages, the script will retry automatically for transient errors. Non-retryable failures are written to the log sheet so the file is not retried.
